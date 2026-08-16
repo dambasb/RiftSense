@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.spec
+*.exe
+*.msi
+*.zip
+
+# Local IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Local RiftSense user data / secrets
+settings.json
+history/
+cache/
+backups/
+player_memory.json
+performance_history.json
+ai_reviews/
+.env
+.env.*
+
+# Never commit API keys or local credentials
+*.key
+*.pem
