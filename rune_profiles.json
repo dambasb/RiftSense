@@ -1,0 +1,102 @@
+{
+  "Wukong": {
+    "recommended": {
+      "label": "Conqueror — standard bruiser",
+      "runes": "Conqueror • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight"
+    },
+    "alternative": {
+      "label": "Phase Rush — mobility",
+      "runes": "Phase Rush • Nimbus Cloak • Celerity • Waterwalking | Triumph • Legend: Alacrity"
+    }
+  },
+  "Nocturne": {
+    "recommended": {
+      "label": "Lethal Tempo — sustained dueling",
+      "runes": "Lethal Tempo • Triumph • Legend: Alacrity • Coup de Grace | Grisly Mementos • Ultimate Hunter"
+    },
+    "alternative": {
+      "label": "Conqueror — extended fights",
+      "runes": "Conqueror • Triumph • Legend: Alacrity • Last Stand | Grisly Mementos • Ultimate Hunter"
+    }
+  },
+  "Jarvan IV": {
+    "recommended": {
+      "label": "Conqueror — standard fighter",
+      "runes": "Conqueror • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight"
+    },
+    "alternative": {
+      "label": "Electrocute — early burst",
+      "runes": "Electrocute • Sudden Impact • Grisly Mementos • Relentless Hunter | Triumph • Coup de Grace"
+    }
+  },
+  "Amumu": {
+    "recommended": {
+      "label": "Aftershock — tank engage",
+      "runes": "Aftershock • Font of Life • Conditioning • Overgrowth | Cheap Shot • Ultimate Hunter"
+    },
+    "alternative": {
+      "label": "Conqueror — extended AP fights",
+      "runes": "Conqueror • Triumph • Legend: Haste • Last Stand | Cheap Shot • Ultimate Hunter"
+    }
+  },
+  "Maokai": {
+    "recommended": {
+      "label": "Aftershock — tank engage",
+      "runes": "Aftershock • Font of Life • Conditioning • Overgrowth | Cheap Shot • Ultimate Hunter"
+    },
+    "alternative": {
+      "label": "Phase Rush — faster disengage",
+      "runes": "Phase Rush • Nimbus Cloak • Celerity • Waterwalking | Font of Life • Overgrowth"
+    }
+  },
+  "Warwick": {
+    "recommended": {
+      "label": "Lethal Tempo — dueling",
+      "runes": "Lethal Tempo • Triumph • Legend: Alacrity • Last Stand | Celerity • Waterwalking"
+    },
+    "alternative": {
+      "label": "Press the Attack — burst target",
+      "runes": "Press the Attack • Triumph • Legend: Alacrity • Last Stand | Celerity • Waterwalking"
+    }
+  },
+  "Vi": {
+    "recommended": {
+      "label": "Conqueror — standard fighter",
+      "runes": "Conqueror • Triumph • Legend: Alacrity • Coup de Grace | Sudden Impact • Ultimate Hunter"
+    },
+    "alternative": {
+      "label": "Hail of Blades — burst engage",
+      "runes": "Hail of Blades • Sudden Impact • Grisly Mementos • Ultimate Hunter | Triumph • Coup de Grace"
+    }
+  },
+  "Jax": {
+    "recommended": {
+      "label": "Lethal Tempo — sustained DPS",
+      "runes": "Lethal Tempo • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight"
+    },
+    "alternative": {
+      "label": "Conqueror — extended fights",
+      "runes": "Conqueror • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight"
+    }
+  },
+  "Shen": {
+    "recommended": {
+      "label": "Aftershock — jungle engage",
+      "runes": "Aftershock • Shield Bash • Conditioning • Revitalize | Cheap Shot • Ultimate Hunter"
+    },
+    "alternative": {
+      "label": "Grasp — durable skirmishing",
+      "runes": "Grasp of the Undying • Shield Bash • Conditioning • Revitalize | Cheap Shot • Ultimate Hunter"
+    }
+  },
+  "Nasus": {
+    "recommended": {
+      "label": "Fleet Footwork — sustain",
+      "runes": "Fleet Footwork • Triumph • Legend: Haste • Last Stand | Conditioning • Overgrowth"
+    },
+    "alternative": {
+      "label": "Phase Rush — stick/disengage",
+      "runes": "Phase Rush • Nimbus Cloak • Celerity • Waterwalking | Triumph • Legend: Haste"
+    }
+  }
+}

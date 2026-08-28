@@ -1,0 +1,18 @@
+{
+  "source": "Mobalytics",
+  "patch": "26.15",
+  "role": "Jungle",
+  "rank_scope": "Emerald+",
+  "tiers": {
+    "Wukong": "S",
+    "Nocturne": "S",
+    "Jarvan IV": "B",
+    "Amumu": "A",
+    "Maokai": "A",
+    "Warwick": "S",
+    "Vi": "A",
+    "Jax": "C",
+    "Shen": "C",
+    "Nasus": "S"
+  }
+}

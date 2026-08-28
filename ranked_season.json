@@ -1,0 +1,10 @@
+{
+  "name": "2026 Season 3",
+  "start_local": "2026-07-29T12:00:00",
+  "queues": {
+    "420": "Ranked Solo/Duo",
+    "440": "Ranked Flex"
+  },
+  "year_name": "2026 Ranked Year",
+  "year_start_local": "2026-01-08T12:00:00"
+}

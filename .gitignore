@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local RiftSense runtime data — never commit
+settings.json
+history/
+cache/
+logs/
+ai_reviews/
+player_memory.json
+performance_history.json
+rank_progress.json
+riot_account.json
+games.csv
+
+# Local secrets / environment
+.env
+.env.*
+*.key
+*.pem
+
+# Build / package output
+build/
+dist/
+*.zip
+*.exe
+*.msi
+
+# Local previews / diagnostics
+*_Preview.png
+*_preview.png
+crash-*.txt
+*.log

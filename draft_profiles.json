@@ -1,0 +1,162 @@
+{
+  "Wukong": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 7.2,
+    "frontline": 3,
+    "engage": 3,
+    "cc": 2,
+    "early": 2,
+    "scaling": 2,
+    "antiSquishy": 2,
+    "antiTank": 2,
+    "knockup": 3,
+    "summary": "Reliable bruiser engage and strong teamfight setup."
+  },
+  "Nocturne": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 6.9,
+    "frontline": 1,
+    "engage": 2,
+    "cc": 1,
+    "early": 2,
+    "scaling": 2,
+    "antiSquishy": 3,
+    "antiTank": 1,
+    "knockup": 0,
+    "summary": "Strong back-line access and map pressure, but limited frontline."
+  },
+  "Jarvan IV": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 7.1,
+    "frontline": 3,
+    "engage": 3,
+    "cc": 2,
+    "early": 3,
+    "scaling": 1,
+    "antiSquishy": 2,
+    "antiTank": 2,
+    "knockup": 2,
+    "summary": "Excellent early pressure, engage and physical-team utility."
+  },
+  "Amumu": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AP",
+    "base": 6.9,
+    "frontline": 3,
+    "engage": 3,
+    "cc": 3,
+    "early": 1,
+    "scaling": 2,
+    "antiSquishy": 2,
+    "antiTank": 3,
+    "knockup": 0,
+    "summary": "Adds magic damage, frontline and very high teamfight CC."
+  },
+  "Maokai": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AP",
+    "base": 6.6,
+    "frontline": 3,
+    "engage": 3,
+    "cc": 3,
+    "early": 2,
+    "scaling": 2,
+    "antiSquishy": 1,
+    "antiTank": 2,
+    "knockup": 1,
+    "summary": "High-utility tank with reliable engage and pick tools."
+  },
+  "Warwick": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 6.6,
+    "frontline": 2,
+    "engage": 2,
+    "cc": 2,
+    "early": 3,
+    "scaling": 1,
+    "antiSquishy": 2,
+    "antiTank": 2,
+    "knockup": 0,
+    "summary": "Strong early skirmishing, sustain and target pressure."
+  },
+  "Vi": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 6.8,
+    "frontline": 2,
+    "engage": 3,
+    "cc": 2,
+    "early": 3,
+    "scaling": 1,
+    "antiSquishy": 3,
+    "antiTank": 2,
+    "knockup": 1,
+    "summary": "Reliable point-and-click access to priority carries."
+  },
+  "Jax": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 6.1,
+    "frontline": 2,
+    "engage": 1,
+    "cc": 1,
+    "early": 2,
+    "scaling": 3,
+    "antiSquishy": 2,
+    "antiTank": 3,
+    "knockup": 0,
+    "summary": "Scaling duelist with side-lane strength; less reliable engage."
+  },
+  "Shen": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "MIXED",
+    "base": 5.8,
+    "frontline": 3,
+    "engage": 2,
+    "cc": 2,
+    "early": 2,
+    "scaling": 1,
+    "antiSquishy": 1,
+    "antiTank": 1,
+    "knockup": 0,
+    "summary": "Global utility and frontline, but a more specialized jungle pick."
+  },
+  "Nasus": {
+    "role": [
+      "JUNGLE"
+    ],
+    "damage": "AD",
+    "base": 5.5,
+    "frontline": 2,
+    "engage": 0,
+    "cc": 1,
+    "early": 1,
+    "scaling": 3,
+    "antiSquishy": 1,
+    "antiTank": 3,
+    "knockup": 0,
+    "summary": "Scaling and anti-tank value, but low early tempo and engage."
+  }
+}

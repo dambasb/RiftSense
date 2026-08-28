@@ -1,0 +1,282 @@
+{
+  "Wukong": {
+    "referencePatch": "26.15 starter profile",
+    "balanced": [
+      "Trinity Force",
+      "Sundered Sky",
+      "Black Cleaver",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "magic": [
+      "Trinity Force",
+      "Sundered Sky",
+      "Maw of Malmortius",
+      "Black Cleaver",
+      "Sterak's Gage"
+    ],
+    "physical": [
+      "Trinity Force",
+      "Sundered Sky",
+      "Death's Dance",
+      "Black Cleaver",
+      "Guardian Angel"
+    ],
+    "bootsBalanced": "Plated Steelcaps / Mercury's Treads",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Baseline path uses enemy champion composition. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Nocturne": {
+    "referencePatch": "26.15 starter profile",
+    "balanced": [
+      "Stridebreaker",
+      "Experimental Hexplate",
+      "Black Cleaver",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "magic": [
+      "Stridebreaker",
+      "Experimental Hexplate",
+      "Maw of Malmortius",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "physical": [
+      "Stridebreaker",
+      "Experimental Hexplate",
+      "Death's Dance",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "bootsBalanced": "Plated Steelcaps / Mercury's Treads",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Dual-identity Nocturne profile. RiftSense uses an assassin/lethality path when allied frontline is already covered, and falls back to the bruiser path when the team still needs Nocturne to survive first contact. Enemy threat adaptation may add at most one defensive damage item in assassin mode."
+  },
+  "Jarvan IV": {
+    "referencePatch": "26.15 starter profile",
+    "balanced": [
+      "Sundered Sky",
+      "Black Cleaver",
+      "Sterak's Gage",
+      "Guardian Angel",
+      "Jak'Sho, The Protean"
+    ],
+    "magic": [
+      "Sundered Sky",
+      "Maw of Malmortius",
+      "Sterak's Gage",
+      "Spirit Visage",
+      "Guardian Angel"
+    ],
+    "physical": [
+      "Sundered Sky",
+      "Death's Dance",
+      "Sterak's Gage",
+      "Guardian Angel",
+      "Randuin's Omen"
+    ],
+    "bootsBalanced": "Plated Steelcaps / Mercury's Treads",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Front-line bruiser profile. Black Cleaver gains value when your team also deals substantial physical damage. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Amumu": {
+    "referencePatch": "26.15 starter profile",
+    "balanced": [
+      "Liandry's Torment",
+      "Sunfire Aegis",
+      "Abyssal Mask",
+      "Jak'Sho, The Protean",
+      "Thornmail"
+    ],
+    "magic": [
+      "Liandry's Torment",
+      "Abyssal Mask",
+      "Kaenic Rookern",
+      "Jak'Sho, The Protean",
+      "Thornmail"
+    ],
+    "physical": [
+      "Liandry's Torment",
+      "Sunfire Aegis",
+      "Thornmail",
+      "Jak'Sho, The Protean",
+      "Randuin's Omen"
+    ],
+    "bootsBalanced": "Mercury's Treads / Plated Steelcaps",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Tank/AP-burn profile. Defensive item order should match the pre-game damage profile rather than blindly copying one fixed six-item build. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Maokai": {
+    "referencePatch": "starter profile",
+    "balanced": [
+      "Liandry's Torment",
+      "Sunfire Aegis",
+      "Abyssal Mask",
+      "Jak'Sho, The Protean",
+      "Thornmail"
+    ],
+    "magic": [
+      "Liandry's Torment",
+      "Abyssal Mask",
+      "Kaenic Rookern",
+      "Spirit Visage",
+      "Jak'Sho, The Protean"
+    ],
+    "physical": [
+      "Liandry's Torment",
+      "Sunfire Aegis",
+      "Thornmail",
+      "Randuin's Omen",
+      "Jak'Sho, The Protean"
+    ],
+    "bootsBalanced": "Mercury's Treads / Plated Steelcaps",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Tank/engage profile. This is a starter profile and is intentionally easy to edit in profiles.json. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Warwick": {
+    "referencePatch": "starter profile",
+    "balanced": [
+      "Stridebreaker",
+      "Blade of The Ruined King",
+      "Sterak's Gage",
+      "Spirit Visage",
+      "Guardian Angel"
+    ],
+    "magic": [
+      "Stridebreaker",
+      "Blade of The Ruined King",
+      "Maw of Malmortius",
+      "Spirit Visage",
+      "Sterak's Gage"
+    ],
+    "physical": [
+      "Stridebreaker",
+      "Blade of The Ruined King",
+      "Death's Dance",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "bootsBalanced": "Plated Steelcaps / Mercury's Treads",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Duelist/bruiser starter profile. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Vi": {
+    "referencePatch": "starter profile",
+    "balanced": [
+      "Sundered Sky",
+      "Black Cleaver",
+      "Sterak's Gage",
+      "Guardian Angel",
+      "Death's Dance"
+    ],
+    "magic": [
+      "Sundered Sky",
+      "Black Cleaver",
+      "Maw of Malmortius",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "physical": [
+      "Sundered Sky",
+      "Black Cleaver",
+      "Death's Dance",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "bootsBalanced": "Plated Steelcaps / Mercury's Treads",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Bruiser/engage starter profile. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Jax": {
+    "referencePatch": "starter profile",
+    "balanced": [
+      "Trinity Force",
+      "Sundered Sky",
+      "Sterak's Gage",
+      "Death's Dance",
+      "Guardian Angel"
+    ],
+    "magic": [
+      "Trinity Force",
+      "Sundered Sky",
+      "Maw of Malmortius",
+      "Sterak's Gage",
+      "Spirit Visage"
+    ],
+    "physical": [
+      "Trinity Force",
+      "Sundered Sky",
+      "Death's Dance",
+      "Sterak's Gage",
+      "Guardian Angel"
+    ],
+    "bootsBalanced": "Plated Steelcaps / Mercury's Treads",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Duelist starter profile. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Shen": {
+    "referencePatch": "starter profile",
+    "balanced": [
+      "Sunfire Aegis",
+      "Titanic Hydra",
+      "Spirit Visage",
+      "Thornmail",
+      "Randuin's Omen"
+    ],
+    "magic": [
+      "Hollow Radiance",
+      "Spirit Visage",
+      "Kaenic Rookern",
+      "Titanic Hydra",
+      "Thornmail"
+    ],
+    "physical": [
+      "Sunfire Aegis",
+      "Thornmail",
+      "Randuin's Omen",
+      "Titanic Hydra",
+      "Spirit Visage"
+    ],
+    "bootsBalanced": "Mercury's Treads / Plated Steelcaps",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Experimental jungle starter profile; Shen jungle is much less standard than the core four profiles. Threat-aware options separately react to visible enemy inventories."
+  },
+  "Nasus": {
+    "referencePatch": "starter profile",
+    "balanced": [
+      "Trinity Force",
+      "Frozen Heart",
+      "Spirit Visage",
+      "Sterak's Gage",
+      "Thornmail"
+    ],
+    "magic": [
+      "Trinity Force",
+      "Spirit Visage",
+      "Kaenic Rookern",
+      "Sterak's Gage",
+      "Thornmail"
+    ],
+    "physical": [
+      "Trinity Force",
+      "Frozen Heart",
+      "Thornmail",
+      "Sterak's Gage",
+      "Randuin's Omen"
+    ],
+    "bootsBalanced": "Ionian Boots of Lucidity",
+    "bootsMagic": "Mercury's Treads",
+    "bootsPhysical": "Plated Steelcaps",
+    "note": "Experimental jungle starter profile; Nasus jungle is not treated as a standard meta jungle pick. Threat-aware options separately react to visible enemy inventories."
+  }
+}

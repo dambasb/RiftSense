@@ -1,0 +1,270 @@
+{
+  "Wukong": {
+    "synergyWith": [
+      "Yasuo",
+      "Orianna",
+      "Miss Fortune",
+      "Galio",
+      "Rakan",
+      "Samira"
+    ],
+    "goodInto": [
+      "Aphelios",
+      "Jinx",
+      "Jhin",
+      "Miss Fortune",
+      "Caitlyn",
+      "Xerath",
+      "Vel'Koz",
+      "Brand"
+    ],
+    "badInto": [
+      "Poppy",
+      "Janna",
+      "Gragas",
+      "Taliyah",
+      "Morgana",
+      "Olaf"
+    ]
+  },
+  "Nocturne": {
+    "synergyWith": [
+      "Twisted Fate",
+      "Shen",
+      "Galio",
+      "Orianna",
+      "Ahri",
+      "Katarina"
+    ],
+    "goodInto": [
+      "Jinx",
+      "Jhin",
+      "Caitlyn",
+      "Xerath",
+      "Vel'Koz",
+      "Lux",
+      "Karthus",
+      "Senna"
+    ],
+    "badInto": [
+      "Poppy",
+      "Lulu",
+      "Janna",
+      "Alistar",
+      "Rammus",
+      "Malphite"
+    ]
+  },
+  "Jarvan IV": {
+    "synergyWith": [
+      "Orianna",
+      "Galio",
+      "Rumble",
+      "Miss Fortune",
+      "Kennen",
+      "Viktor"
+    ],
+    "goodInto": [
+      "Jinx",
+      "Jhin",
+      "Caitlyn",
+      "Xerath",
+      "Vel'Koz",
+      "Brand",
+      "Varus"
+    ],
+    "badInto": [
+      "Ezreal",
+      "Tristana",
+      "Kassadin",
+      "Fizz",
+      "Camille",
+      "Poppy"
+    ]
+  },
+  "Amumu": {
+    "synergyWith": [
+      "Miss Fortune",
+      "Kennen",
+      "Katarina",
+      "Samira",
+      "Brand",
+      "Orianna"
+    ],
+    "goodInto": [
+      "Yasuo",
+      "Yone",
+      "Master Yi",
+      "Samira",
+      "Katarina",
+      "Darius"
+    ],
+    "badInto": [
+      "Olaf",
+      "Morgana",
+      "Kindred",
+      "Trundle",
+      "Gwen",
+      "Vayne"
+    ]
+  },
+  "Maokai": {
+    "synergyWith": [
+      "Jhin",
+      "Caitlyn",
+      "Orianna",
+      "Miss Fortune",
+      "Jayce",
+      "Ziggs"
+    ],
+    "goodInto": [
+      "Rengar",
+      "Kha'Zix",
+      "Talon",
+      "Zed",
+      "Qiyana",
+      "Akali"
+    ],
+    "badInto": [
+      "Olaf",
+      "Gwen",
+      "Vayne",
+      "Trundle",
+      "Lillia",
+      "Fiora"
+    ]
+  },
+  "Warwick": {
+    "synergyWith": [
+      "Renekton",
+      "Pantheon",
+      "Twisted Fate",
+      "Galio",
+      "Leona",
+      "Nautilus"
+    ],
+    "goodInto": [
+      "Master Yi",
+      "Viego",
+      "Bel'Veth",
+      "Briar",
+      "Xin Zhao",
+      "Lee Sin"
+    ],
+    "badInto": [
+      "Lillia",
+      "Kindred",
+      "Graves",
+      "Nidalee",
+      "Ashe",
+      "Janna"
+    ]
+  },
+  "Vi": {
+    "synergyWith": [
+      "Ahri",
+      "Orianna",
+      "Galio",
+      "Yasuo",
+      "Samira",
+      "LeBlanc"
+    ],
+    "goodInto": [
+      "Jinx",
+      "Jhin",
+      "Caitlyn",
+      "Aphelios",
+      "Xerath",
+      "Vel'Koz",
+      "Senna"
+    ],
+    "badInto": [
+      "Poppy",
+      "Morgana",
+      "Xayah",
+      "Sivir",
+      "Zilean",
+      "Kindred"
+    ]
+  },
+  "Jax": {
+    "synergyWith": [
+      "Lulu",
+      "Zilean",
+      "Orianna",
+      "Yuumi",
+      "Karma",
+      "Seraphine"
+    ],
+    "goodInto": [
+      "Master Yi",
+      "Viego",
+      "Bel'Veth",
+      "Tryndamere",
+      "Yasuo",
+      "Yone",
+      "Xin Zhao"
+    ],
+    "badInto": [
+      "Gragas",
+      "Malphite",
+      "Kennen",
+      "Lillia",
+      "Singed",
+      "Poppy"
+    ]
+  },
+  "Shen": {
+    "synergyWith": [
+      "Jinx",
+      "Vayne",
+      "Kog'Maw",
+      "Samira",
+      "Katarina",
+      "Akali"
+    ],
+    "goodInto": [
+      "Rengar",
+      "Talon",
+      "Zed",
+      "Kha'Zix",
+      "Qiyana",
+      "Nocturne"
+    ],
+    "badInto": [
+      "Trundle",
+      "Gwen",
+      "Lillia",
+      "Fiora",
+      "Darius",
+      "Olaf"
+    ]
+  },
+  "Nasus": {
+    "synergyWith": [
+      "Zilean",
+      "Lulu",
+      "Karma",
+      "Seraphine",
+      "Orianna",
+      "Milio"
+    ],
+    "goodInto": [
+      "Master Yi",
+      "Tryndamere",
+      "Viego",
+      "Yasuo",
+      "Yone",
+      "Bel'Veth"
+    ],
+    "badInto": [
+      "Kindred",
+      "Graves",
+      "Nidalee",
+      "Lee Sin",
+      "Elise",
+      "Rek'Sai",
+      "Xin Zhao"
+    ]
+  }
+}

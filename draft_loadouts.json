@@ -1,0 +1,42 @@
+{
+  "Wukong": {
+    "runes": "Conqueror • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight",
+    "summoners": "Flash + Smite"
+  },
+  "Nocturne": {
+    "runes": "Lethal Tempo • Triumph • Legend: Alacrity • Coup de Grace | Grisly Mementos • Ultimate Hunter",
+    "summoners": "Flash + Smite"
+  },
+  "Jarvan IV": {
+    "runes": "Conqueror • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight",
+    "summoners": "Flash + Smite"
+  },
+  "Amumu": {
+    "runes": "Aftershock • Font of Life • Conditioning • Overgrowth | Cheap Shot • Ultimate Hunter",
+    "summoners": "Flash + Smite"
+  },
+  "Maokai": {
+    "runes": "Aftershock • Font of Life • Conditioning • Overgrowth | Cheap Shot • Ultimate Hunter",
+    "summoners": "Flash + Smite"
+  },
+  "Warwick": {
+    "runes": "Lethal Tempo • Triumph • Legend: Alacrity • Last Stand | Celerity • Waterwalking",
+    "summoners": "Flash + Smite"
+  },
+  "Vi": {
+    "runes": "Conqueror • Triumph • Legend: Alacrity • Coup de Grace | Sudden Impact • Ultimate Hunter",
+    "summoners": "Flash + Smite"
+  },
+  "Jax": {
+    "runes": "Lethal Tempo • Triumph • Legend: Alacrity • Last Stand | Magical Footwear • Cosmic Insight",
+    "summoners": "Flash + Smite"
+  },
+  "Shen": {
+    "runes": "Aftershock • Shield Bash • Conditioning • Revitalize | Cheap Shot • Ultimate Hunter",
+    "summoners": "Flash + Smite"
+  },
+  "Nasus": {
+    "runes": "Fleet Footwork • Triumph • Legend: Haste • Last Stand | Conditioning • Overgrowth",
+    "summoners": "Flash + Smite"
+  }
+}
