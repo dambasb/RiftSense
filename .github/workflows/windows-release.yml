@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-release:
     runs-on: windows-latest
@@ -98,12 +102,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG"
+          try {
+            Invoke-RestMethod -Uri $uri -Headers $headers -Method Get | Out-Null
             "exists=true" >> $env:GITHUB_OUTPUT
             Write-Host "Release $env:TAG already exists; build verified, no duplicate release created."
-          } else {
-            "exists=false" >> $env:GITHUB_OUTPUT
+          } catch {
+            $status = [int]$_.Exception.Response.StatusCode
+            if ($status -eq 404) {
+              "exists=false" >> $env:GITHUB_OUTPUT
+              Write-Host "Release $env:TAG does not exist yet; it will be created."
+            } else {
+              throw
+            }
           }
 
       - name: Create GitHub Release
