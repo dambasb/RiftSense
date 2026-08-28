@@ -1,0 +1,129 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller>=6.10,<7"
+
+      - name: Public source audit
+        shell: pwsh
+        run: python tools/pre_push_public_audit.py
+
+      - name: Regression tests
+        shell: pwsh
+        run: python tools/run_tests.py
+
+      - name: Code quality audit
+        shell: pwsh
+        run: python tools/code_quality_audit.py
+
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path "RiftSense.py" -Pattern '^UPDATE_VERSION = "([^"]+)"$'
+          if (-not $match) { throw "UPDATE_VERSION was not found in RiftSense.py" }
+          $version = $match.Matches[0].Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw "UPDATE_VERSION is not valid SemVer: $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build one-file RiftSense.exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name RiftSense `
+            --icon "assets/riftsense.ico" `
+            --add-data "assets;assets" `
+            --add-data "profiles.json;." `
+            --add-data "traits.json;." `
+            --add-data "draft_profiles.json;." `
+            --add-data "draft_relationships.json;." `
+            --add-data "draft_loadouts.json;." `
+            --add-data "rune_profiles.json;." `
+            --add-data "tier_data.json;." `
+            --add-data "ranked_season.json;." `
+            RiftSense.py
+
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/RiftSense.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  RiftSense.exe" | Set-Content -Path "dist/RiftSense.exe.sha256" -Encoding ascii
+          Get-Content "dist/RiftSense.exe.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiftSense-${{ steps.version.outputs.version }}-Windows
+          path: |
+            dist/RiftSense.exe
+            dist/RiftSense.exe.sha256
+          if-no-files-found: error
+
+      - name: Check whether release already exists
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "exists=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Release $env:TAG already exists; build verified, no duplicate release created."
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Create GitHub Release
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $args = @(
+            "release", "create", "$env:TAG",
+            "dist/RiftSense.exe",
+            "dist/RiftSense.exe.sha256",
+            "--repo", "$env:GITHUB_REPOSITORY",
+            "--target", "$env:GITHUB_SHA",
+            "--title", "RiftSense $env:TAG",
+            "--generate-notes"
+          )
+          if ($env:VERSION.Contains("-")) {
+            $args += "--prerelease"
+          }
+          & gh @args
