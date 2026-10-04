@@ -3,11 +3,19 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from riftsense.core.security import require_riot_api_url
 
 JsonResponse = tuple[Any, int | None, dict[str, str]]
+
+
+class _RiotApiRedirectHandler(HTTPRedirectHandler):
+    """Validate every Riot API redirect before urllib follows it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_riot_api_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class RiotPublicClient:
@@ -15,6 +23,7 @@ class RiotPublicClient:
 
     def __init__(self, user_agent: str = "RiftSense/v1-beta") -> None:
         self.user_agent = user_agent
+        self._opener = build_opener(_RiotApiRedirectHandler())
 
     def get_json(self, url: str, api_key: str, timeout: float = 12.0) -> JsonResponse:
         require_riot_api_url(url)
@@ -28,7 +37,7 @@ class RiotPublicClient:
             method="GET",
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 require_riot_api_url(str(response.geturl() or url))
                 raw = response.read().decode("utf-8")
                 data = json.loads(raw) if raw else {}

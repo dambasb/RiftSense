@@ -215,6 +215,8 @@ CLIENT_ITEM_CACHE_DIR = CACHE_DIR / "league_client_items"
 CHAMP_CACHE_DIR = CACHE_DIR / "champions"
 META_CACHE_DIR = CACHE_DIR / "meta"
 META_CONSENSUS_DIR = CACHE_DIR / "meta_consensus"
+LEGACY_MIGRATION_VERSION = 1
+LEGACY_MIGRATION_MARKER_PATH = DATA_DIR / "legacy_migration.json"
 
 LIVE_ENDPOINT = "https://127.0.0.1:2999/liveclientdata/allgamedata"
 DDRAGON_BASE = "https://ddragon.leagueoflegends.com"
@@ -822,59 +824,302 @@ def _legacy_data_candidates():
     )
 
 
-def migrate_legacy_user_data():
+def _legacy_migration_complete():
+    marker = load_json(
+        LEGACY_MIGRATION_MARKER_PATH,
+        {},
+    )
+    if not isinstance(
+        marker,
+        dict,
+    ) or not marker.get(
+        "completed",
+        False,
+    ):
+        return False
+    try:
+        return int(
+            marker.get(
+                "version",
+                0,
+            )
+            or 0
+        ) >= LEGACY_MIGRATION_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_legacy_source_file(
+    source,
+):
+    if source.suffix.lower() != ".json":
+        return True, ""
+    try:
+        with source.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            json.load(
+                handle
+            )
+        return True, ""
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return False, str(
+            exc
+        )
+
+
+def _copy_legacy_file_if_missing(
+    source,
+    destination,
+):
+    source = Path(
+        source
+    )
+    destination = Path(
+        destination
+    )
+
+    if destination.exists():
+        return "conflict", ""
+
+    valid, error = _validate_legacy_source_file(
+        source
+    )
+    if not valid:
+        return "failed", error
+
+    created = False
+    try:
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        with source.open(
+            "rb",
+        ) as source_handle:
+            # Exclusive creation closes the exists()/copy race. Even if another
+            # writer creates the destination now, its version always wins.
+            with destination.open(
+                "xb",
+            ) as destination_handle:
+                created = True
+                shutil.copyfileobj(
+                    source_handle,
+                    destination_handle,
+                )
+        try:
+            shutil.copystat(
+                source,
+                destination,
+            )
+        except OSError:
+            pass
+        return "copied", ""
+    except FileExistsError:
+        return "conflict", ""
+    except (
+        OSError,
+        ValueError,
+    ) as exc:
+        if created:
+            try:
+                destination.unlink(
+                    missing_ok=True,
+                )
+            except OSError:
+                pass
+        return "failed", str(
+            exc
+        )
+
+
+def migrate_legacy_user_data(
+    candidates=None,
+):
     """
     Merge older local app data into the version-independent DATA_DIR.
 
     Existing persistent files always win. Missing history/raw-match/cache files
     are copied without deleting anything from older versions.
     """
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    if _legacy_migration_complete():
+        return True
+
+    migration_logger = logging.getLogger(
+        f"{APP_NAME}.migration"
     )
+    failures = []
+    copied = []
+    skipped_conflicts = []
 
-    candidates = _legacy_data_candidates()
+    try:
+        DATA_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+    except OSError as exc:
+        migration_logger.warning(
+            "Legacy migration could not create the user-data directory: %s",
+            exc,
+        )
+        return False
 
-    # Prefer the richest/newest previous settings file only when persistent
-    # settings do not already exist.
-    if not SETTINGS_PATH.exists():
-        for legacy in candidates:
-            legacy_settings = legacy / "settings.json"
-            if legacy_settings.exists():
-                try:
-                    shutil.copy2(
-                        legacy_settings,
-                        SETTINGS_PATH,
-                    )
-                    break
-                except OSError:
-                    pass
+    if candidates is None:
+        candidates = _legacy_data_candidates()
+    candidates = [
+        Path(candidate)
+        for candidate in candidates
+    ]
+
+    def migrate_file(
+        source,
+        destination,
+        relative_path,
+        source_name,
+    ):
+        status, error = _copy_legacy_file_if_missing(
+            source,
+            destination,
+        )
+        record = {
+            "source": source_name,
+            "path": relative_path,
+        }
+        if status == "copied":
+            copied.append(
+                record
+            )
+        elif status == "conflict":
+            skipped_conflicts.append(
+                record
+            )
+            migration_logger.info(
+                "Legacy migration kept existing destination and skipped %s from %s.",
+                relative_path,
+                source_name,
+            )
+        else:
+            failures.append({
+                **record,
+                "error": error,
+            })
+            migration_logger.warning(
+                "Legacy migration could not copy %s from %s: %s",
+                relative_path,
+                source_name,
+                error,
+            )
 
     for legacy in candidates:
-        legacy_history = legacy / "history"
-        if legacy_history.exists():
-            try:
-                shutil.copytree(
-                    legacy_history,
-                    HISTORY_DIR,
-                    dirs_exist_ok=True,
-                    copy_function=shutil.copy2,
-                )
-            except OSError:
-                pass
+        source_name = legacy.name
+        legacy_settings = legacy / "settings.json"
+        if legacy_settings.is_file():
+            migrate_file(
+                legacy_settings,
+                SETTINGS_PATH,
+                "settings.json",
+                source_name,
+            )
 
-        legacy_cache = legacy / "cache"
-        if legacy_cache.exists():
+        for directory_name, destination_root in (
+            (
+                "history",
+                HISTORY_DIR,
+            ),
+            (
+                "cache",
+                CACHE_DIR,
+            ),
+        ):
+            source_root = legacy / directory_name
+            if not source_root.is_dir():
+                continue
             try:
-                shutil.copytree(
-                    legacy_cache,
-                    CACHE_DIR,
-                    dirs_exist_ok=True,
-                    copy_function=shutil.copy2,
+                source_files = sorted(
+                    (
+                        path
+                        for path in source_root.rglob(
+                            "*"
+                        )
+                        if path.is_file()
+                    ),
+                    key=lambda path: str(
+                        path
+                    ).lower(),
                 )
-            except OSError:
-                pass
+            except OSError as exc:
+                failures.append({
+                    "source": source_name,
+                    "path": directory_name + "/",
+                    "error": str(
+                        exc
+                    ),
+                })
+                migration_logger.warning(
+                    "Legacy migration could not read %s from %s: %s",
+                    directory_name,
+                    source_name,
+                    exc,
+                )
+                continue
+
+            for source in source_files:
+                relative = source.relative_to(
+                    source_root
+                )
+                relative_text = (
+                    Path(
+                        directory_name
+                    )
+                    / relative
+                ).as_posix()
+                migrate_file(
+                    source,
+                    destination_root / relative,
+                    relative_text,
+                    source_name,
+                )
+
+    if failures:
+        migration_logger.warning(
+            "Legacy migration remains incomplete after %d copy failure(s); startup will retry safely.",
+            len(
+                failures
+            ),
+        )
+        return False
+
+    marker = {
+        "version": LEGACY_MIGRATION_VERSION,
+        "completed": True,
+        "completed_at": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        "sources_considered": [
+            candidate.name
+            for candidate in candidates
+        ],
+        "copied": copied,
+        "skipped_conflicts": skipped_conflicts,
+    }
+    marker_written, marker_error = write_json_atomic(
+        LEGACY_MIGRATION_MARKER_PATH,
+        marker,
+    )
+    if not marker_written:
+        migration_logger.warning(
+            "Legacy migration completed but its marker could not be written: %s",
+            marker_error,
+        )
+        return False
+    return True
 
 
 migrate_legacy_user_data()
@@ -12668,6 +12913,9 @@ class App(tk.Tk):
         self._rune_import_queue = queue.Queue()
         self._rune_import_watch_job = None
         self._pending_rune_import_request = None
+        self._rune_import_generation = 0
+        self._rune_import_draft_active = False
+        self._rune_import_shutdown = False
         self.last_rune_import_signature = None
         self.current_rune_champion = ""
         self.current_rune_role = ""
@@ -38838,6 +39086,9 @@ class App(tk.Tk):
 
 
     def on_close(self):
+        self._rune_import_shutdown = True
+        self._rune_import_generation += 1
+        self._pending_rune_import_request = None
         log_info(
             "Application closing"
         )
@@ -39148,13 +39399,165 @@ class App(tk.Tk):
         return None
 
 
+    def _rune_import_matches_current_state(
+        self,
+        generation,
+        champion,
+        role,
+    ):
+        return bool(
+            not getattr(
+                self,
+                "_rune_import_shutdown",
+                False,
+            )
+            and generation
+            == getattr(
+                self,
+                "_rune_import_generation",
+                -1,
+            )
+            and getattr(
+                self,
+                "_rune_import_draft_active",
+                False,
+            )
+            and normalize_name(
+                champion
+            )
+            == normalize_name(
+                getattr(
+                    self,
+                    "current_rune_champion",
+                    "",
+                )
+            )
+            and draft_role_key(
+                role
+            )
+            == draft_role_key(
+                getattr(
+                    self,
+                    "current_rune_role",
+                    "",
+                )
+            )
+        )
+
+    def _rune_import_prewrite_valid(
+        self,
+        generation,
+        champion,
+        role,
+    ):
+        if not self._rune_import_matches_current_state(
+            generation,
+            champion,
+            role,
+        ):
+            return False
+
+        session, status = self.lcu.get(
+            "/lol-champ-select/v1/session",
+            timeout=0.8,
+        )
+
+        # The request may have been superseded while the fresh session read was
+        # in flight, so validate the generation and visible context again.
+        if not self._rune_import_matches_current_state(
+            generation,
+            champion,
+            role,
+        ):
+            return False
+        if status != 200 or not isinstance(
+            session,
+            dict,
+        ):
+            return False
+
+        local_cell = session.get(
+            "localPlayerCellId"
+        )
+        local_entry = next(
+            (
+                entry
+                for entry in (
+                    session.get(
+                        "myTeam"
+                    )
+                    or []
+                )
+                if entry.get(
+                    "cellId"
+                )
+                == local_cell
+            ),
+            None,
+        )
+        if not isinstance(
+            local_entry,
+            dict,
+        ):
+            return False
+
+        session_champion = self.dd.champion_name(
+            local_entry.get(
+                "championId",
+                0,
+            )
+        )
+        session_role = draft_role_key(
+            local_entry.get(
+                "assignedPosition",
+                "",
+            )
+        )
+        return bool(
+            normalize_name(
+                session_champion
+            )
+            == normalize_name(
+                champion
+            )
+            and session_role
+            == draft_role_key(
+                role
+            )
+            and self._rune_import_matches_current_state(
+                generation,
+                champion,
+                role,
+            )
+        )
+
+
     def _rune_import_worker(
         self,
         champion,
         role,
         variant,
         request_signature,
+        generation=None,
     ):
+        if generation is None:
+            generation = getattr(
+                self,
+                "_rune_import_generation",
+                0,
+            )
+
+        def post(
+            payload,
+        ):
+            event = dict(
+                payload
+            )
+            event["generation"] = generation
+            self._rune_import_post(
+                event
+            )
+
         try:
             role_key = draft_role_key(
                 role
@@ -39217,7 +39620,7 @@ class App(tk.Tk):
             )
 
             if not rune_text:
-                self._rune_import_post({
+                post({
                     "type": "error",
                     "message": (
                         f"No {variant} rune profile is available for {champion}."
@@ -39233,7 +39636,7 @@ class App(tk.Tk):
                     )
 
             if not self.dd.rune_name_to_id:
-                self._rune_import_post({
+                post({
                     "type": "error",
                     "message": (
                         "Riot rune data is unavailable. "
@@ -39251,7 +39654,7 @@ class App(tk.Tk):
                 stat_shards=shards,
             )
             if not selection:
-                self._rune_import_post({
+                post({
                     "type": "error",
                     "message": error,
                     "signature": request_signature,
@@ -39263,7 +39666,7 @@ class App(tk.Tk):
                 timeout=1.1,
             )
             if pages_status != 200:
-                self._rune_import_post({
+                post({
                     "type": "error",
                     "message": (
                         "League rune pages are unavailable "
@@ -39302,7 +39705,7 @@ class App(tk.Tk):
                     "id"
                 )
                 if page_id is None:
-                    self._rune_import_post({
+                    post({
                         "type": "error",
                         "message": (
                             "Managed rune page has no page ID."
@@ -39318,25 +39721,45 @@ class App(tk.Tk):
                     base_payload
                 )
 
-                _data, status, write_error = self.lcu.write_json(
-                    (
-                        "/lol-perks/v1/pages/"
-                        + str(
-                            page_id
-                        )
-                    ),
-                    payload,
-                    method="PUT",
-                    timeout=1.2,
+                write_endpoint = (
+                    "/lol-perks/v1/pages/"
+                    + str(
+                        page_id
+                    )
                 )
+                write_payload = payload
+                write_method = "PUT"
                 action = "updated"
             else:
-                _data, status, write_error = self.lcu.write_json(
-                    "/lol-perks/v1/pages",
-                    base_payload,
-                    method="POST",
-                    timeout=1.2,
-                )
+                write_endpoint = "/lol-perks/v1/pages"
+                write_payload = base_payload
+                write_method = "POST"
+
+            # This is the final gate before the only LCU mutation in the worker.
+            # It uses both the in-memory request generation/context and a fresh
+            # Champion Select session read rather than the worker's start state.
+            if not self._rune_import_prewrite_valid(
+                generation,
+                champion,
+                role_key,
+            ):
+                return
+
+            _data, status, write_error = self.lcu.write_json(
+                write_endpoint,
+                write_payload,
+                method=write_method,
+                timeout=1.2,
+            )
+
+            # A request can be superseded while the LCU mutation is in flight.
+            # Its completion must not replace the status of the newer request.
+            if not self._rune_import_matches_current_state(
+                generation,
+                champion,
+                role_key,
+            ):
+                return
 
             if status not in {
                 200,
@@ -39351,7 +39774,7 @@ class App(tk.Tk):
                     }
                     else ""
                 )
-                self._rune_import_post({
+                post({
                     "type": "error",
                     "message": (
                         f"Rune page import failed "
@@ -39400,7 +39823,14 @@ class App(tk.Tk):
                     ]
                 )
 
-            self._rune_import_post({
+            if not self._rune_import_matches_current_state(
+                generation,
+                champion,
+                role_key,
+            ):
+                return
+
+            post({
                 "type": "success",
                 "message": (
                     f"{champion}: {label} • {page_name} {action}"
@@ -39416,7 +39846,7 @@ class App(tk.Tk):
             })
 
         except Exception as exc:
-            self._rune_import_post({
+            post({
                 "type": "error",
                 "message": (
                     f"Rune import error: {exc}"
@@ -39424,7 +39854,7 @@ class App(tk.Tk):
                 "signature": request_signature,
             })
         finally:
-            self._rune_import_post({
+            post({
                 "type": "finished",
                 "signature": request_signature,
             })
@@ -39447,6 +39877,16 @@ class App(tk.Tk):
             event_type = event.get(
                 "type"
             )
+            event_generation = event.get(
+                "generation"
+            )
+            if (
+                event_type != "finished"
+                and event_generation is not None
+                and event_generation
+                != self._rune_import_generation
+            ):
+                continue
             message = str(
                 event.get(
                     "message",
@@ -39497,12 +39937,13 @@ class App(tk.Tk):
             self._pending_rune_import_request = None
 
             if pending:
-                champion, role, variant, automatic = pending
+                champion, role, variant, automatic, generation = pending
                 self._start_rune_import(
                     champion,
                     role,
                     variant,
                     automatic=automatic,
+                    generation=generation,
                 )
                 return
 
@@ -39518,6 +39959,7 @@ class App(tk.Tk):
         role,
         variant,
         automatic=False,
+        generation=None,
     ):
         champion = str(
             champion
@@ -39590,6 +40032,19 @@ class App(tk.Tk):
         ):
             return
 
+        if getattr(
+            self,
+            "_rune_import_shutdown",
+            False,
+        ):
+            return
+
+        if generation is None:
+            self._rune_import_generation += 1
+            generation = self._rune_import_generation
+        elif generation != self._rune_import_generation:
+            return
+
         if (
             self._rune_import_thread
             and self._rune_import_thread.is_alive()
@@ -39599,6 +40054,7 @@ class App(tk.Tk):
                 role,
                 variant,
                 automatic,
+                generation,
             )
             return
 
@@ -39624,6 +40080,7 @@ class App(tk.Tk):
                 role,
                 variant,
                 signature,
+                generation,
             ),
             name="RiftRuneImport",
             daemon=True,
@@ -40219,6 +40676,33 @@ class App(tk.Tk):
             or []
         )
 
+        context_changed = (
+            normalize_name(
+                champion
+            )
+            != normalize_name(
+                getattr(
+                    self,
+                    "current_rune_champion",
+                    "",
+                )
+            )
+            or draft_role_key(
+                role
+            )
+            != draft_role_key(
+                getattr(
+                    self,
+                    "current_rune_role",
+                    "",
+                )
+            )
+        )
+        if context_changed:
+            self._rune_import_generation += 1
+            self._pending_rune_import_request = None
+            self.last_rune_import_signature = None
+
         self.current_rune_champion = champion
         self.current_rune_role = role
         self.current_draft_allies = ally_names
@@ -40398,6 +40882,26 @@ class App(tk.Tk):
             session, status = self.lcu.get("/lol-champ-select/v1/session")
 
         if not session:
+            if (
+                getattr(
+                    self,
+                    "_rune_import_draft_active",
+                    False,
+                )
+                or getattr(
+                    self,
+                    "current_rune_champion",
+                    "",
+                )
+                or getattr(
+                    self,
+                    "current_rune_role",
+                    "",
+                )
+            ):
+                self._rune_import_generation += 1
+                self._pending_rune_import_request = None
+            self._rune_import_draft_active = False
             # Render the empty Draft state once, not on every poll.
             if not self._draft_waiting_rendered:
                 self._draft_waiting_rendered = True
@@ -40438,6 +40942,7 @@ class App(tk.Tk):
                 )
             return False
 
+        self._rune_import_draft_active = True
         self._draft_waiting_rendered = False
 
         local_cell = session.get("localPlayerCellId")
