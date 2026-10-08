@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = ROOT / "RiftSense.py"
@@ -121,6 +122,36 @@ class RuneAndApiRegressionTests(unittest.TestCase):
                 for name, value in old_values.items():
                     setattr(m, name, value)
 
+    def test_restore_refuses_active_ranked_history_worker(self):
+        m = self.m
+
+        class ActiveThread:
+            @staticmethod
+            def is_alive():
+                return True
+
+        class Dummy:
+            _riot_sync_thread = ActiveThread()
+
+            def __init__(self):
+                self.warning = None
+
+            def rs_warning(self, title, message):
+                self.warning = (title, message)
+
+            @staticmethod
+            def rs_confirm(*_args, **_kwargs):
+                raise AssertionError("confirmation must not run during active sync")
+
+        dummy = Dummy()
+        with patch.object(m.filedialog, "askopenfilename", return_value="backup.zip"):
+            with patch.object(m, "restore_backup_transactional") as restore:
+                m.App.restore_user_data(dummy)
+
+        restore.assert_not_called()
+        self.assertIsNotNone(dummy.warning)
+        self.assertIn("sync", dummy.warning[0].lower())
+
     def test_dynamic_managed_rune_page_name(self):
         class Dummy:
             _managed_rune_page_name = self.m.App._managed_rune_page_name
@@ -202,8 +233,9 @@ class RuneAndApiRegressionTests(unittest.TestCase):
         dummy._riot_api_test_thread.join(timeout=2.0)
         self.assertFalse(dummy._riot_api_test_thread.is_alive())
         result = dummy._riot_api_test_queue.get_nowait()
-        self.assertIn("API TEST ERROR", result)
-        self.assertIn("diagnostic boom", result)
+        self.assertEqual(result["outcome"], "FAILED")
+        self.assertIn("API TEST ERROR", result["message"])
+        self.assertNotIn("diagnostic boom", result["message"])
 
 
 if __name__ == "__main__":

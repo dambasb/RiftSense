@@ -172,8 +172,12 @@ class DraftTests(unittest.TestCase):
             _poll_sources_worker = m.App._poll_sources_worker
             def __init__(self):
                 import queue
+                import threading
                 self.lcu = FakeLCU()
                 self._poll_queue = queue.Queue(maxsize=1)
+                self._poll_state_lock = threading.Lock()
+                self._poll_active_generation = 7
+                self._poll_shutdown = False
 
         original_game = m.get_live_game_data
         original_scores = m.get_live_player_scores
@@ -185,8 +189,11 @@ class DraftTests(unittest.TestCase):
                 else None
             )
             dummy = Dummy()
-            dummy._poll_sources_worker()
-            _session, _status, refreshed, _completed = dummy._poll_queue.get_nowait()
+            dummy._poll_sources_worker(7)
+            generation, _session, _status, refreshed, _completed = (
+                dummy._poll_queue.get_nowait()
+            )
+            self.assertEqual(generation, 7)
             mapping = m.lane_player_map([
                 player for player in refreshed["allPlayers"]
                 if player.get("team") == "CHAOS"

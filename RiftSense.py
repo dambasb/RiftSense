@@ -50,10 +50,9 @@ from collections import Counter
 import os
 import re
 import shutil
-import zipfile
-import tempfile
 import time
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 import webbrowser
 import queue
@@ -66,10 +65,29 @@ from urllib.request import Request, urlopen
 from urllib.parse import quote, urlencode, urlparse
 
 from riftsense.core.models import DraftSuggestion, RankEntry
-from riftsense.core.storage import load_json, write_json_atomic
+from riftsense.core.identity import (
+    IdentityDecision,
+    resolve_champion_select_player,
+    resolve_player_identity,
+)
+from riftsense.core.backup import (
+    BackupLayout,
+    RestoreTransactionError,
+    create_backup,
+    restore_backup_transactional,
+)
+from riftsense.core.storage import (
+    delete_json,
+    load_json,
+    update_json,
+    wait_for_json_idle,
+    write_json_atomic,
+    write_json_atomic_if_missing,
+)
 from riftsense.draft.roles import ROLE_KEY_MAP, ROLE_KEYS, canonical_role, role_display
 from riftsense.riot.http import RiotPublicClient
 from riftsense.riot.local_client import LCUClient, get_live_game_data, get_live_player_scores
+from riftsense.riot.workers import RiotWorkerOutcome, RiotWorkerTerminal
 
 # Make Windows render the Tk UI at the monitor's real DPI instead of bitmap
 # scaling the whole application. The call is intentionally best-effort.
@@ -875,6 +893,27 @@ def _validate_legacy_source_file(
         )
 
 
+def _backup_layout():
+    """Resolve the current user-data paths (tests may temporarily redirect them)."""
+    return BackupLayout(
+        settings=SETTINGS_PATH,
+        history=HISTORY_DIR,
+        player_memory=PLAYER_MEMORY_PATH,
+        performance_history=PERFORMANCE_HISTORY_PATH,
+        rank_progress=RANK_PROGRESS_PATH,
+        ai_reviews=AI_REVIEWS_DIR,
+    )
+
+
+def _sanitize_backup_json(relative_path, payload):
+    if (
+        relative_path == "settings.json"
+        or relative_path == "history/riot_account.json"
+    ) and isinstance(payload, dict):
+        strip_persisted_secrets(payload)
+    return payload
+
+
 def _copy_legacy_file_if_missing(
     source,
     destination,
@@ -894,6 +933,32 @@ def _copy_legacy_file_if_missing(
     )
     if not valid:
         return "failed", error
+
+    if source.suffix.lower() == ".json":
+        try:
+            with source.open("r", encoding="utf-8") as source_handle:
+                payload = json.load(source_handle)
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            return "failed", str(exc)
+        written, write_error = write_json_atomic_if_missing(
+            destination,
+            payload,
+        )
+        if written:
+            try:
+                shutil.copystat(source, destination)
+            except OSError:
+                pass
+            return "copied", ""
+        if write_error == "destination exists":
+            return "conflict", ""
+        return "failed", write_error
 
     created = False
     try:
@@ -1186,6 +1251,25 @@ def strip_persisted_secrets(mapping):
             mapping.pop(key, None)
             removed = True
     return removed
+
+
+def update_riot_account(mutator):
+    """Apply one locked read-modify-write transaction to riot_account.json."""
+    def apply(current):
+        if not isinstance(current, dict):
+            current = {}
+        replacement = mutator(current)
+        updated = current if replacement is None else replacement
+        if not isinstance(updated, dict):
+            raise TypeError("Riot account state must remain a JSON object.")
+        strip_persisted_secrets(updated)
+        return updated
+
+    return update_json(
+        RIOT_ACCOUNT_PATH,
+        apply,
+        {},
+    )
 
 
 LOGGER = logging.getLogger(
@@ -1578,41 +1662,13 @@ def save_settings():
         SETTINGS
     )
 
-    try:
-        SETTINGS_PATH.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-        temp_path = SETTINGS_PATH.with_suffix(
-            SETTINGS_PATH.suffix
-            + ".tmp"
-        )
-        temp_path.write_text(
-            json.dumps(
-                SETTINGS,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        temp_path.replace(
-            SETTINGS_PATH
-        )
-        return True
-    except Exception as exc:
-        SETTINGS_SAVE_ERROR = str(
-            exc
-        )
-        try:
-            temp_path = SETTINGS_PATH.with_suffix(
-                SETTINGS_PATH.suffix
-                + ".tmp"
-            )
-            if temp_path.exists():
-                temp_path.unlink()
-        except Exception as exc:
-            log_warning("Best-effort save_settings operation failed: " + str(exc))
-        return False
+    ok, error = write_json_atomic(
+        SETTINGS_PATH,
+        SETTINGS,
+    )
+    if not ok:
+        SETTINGS_SAVE_ERROR = error
+    return ok
 
 
 def normalize_name(value):
@@ -1751,7 +1807,7 @@ def visible_inventory_gold(player, dd):
 
 
 def player_live_identifier(player):
-    """Return the best Live Client identifier for a visible player."""
+    """Return a complete Riot ID suitable for a player-specific endpoint."""
     player = player or {}
     riot_id = str(player.get("riotId") or "").strip()
     if riot_id:
@@ -1762,7 +1818,10 @@ def player_live_identifier(player):
     if game_name and tag_line:
         return f"{game_name}#{tag_line}"
 
-    return str(player.get("summonerName") or "").strip()
+    # A summoner/display name alone is not safe for a player-specific query:
+    # duplicate names could cause the returned score row to be attached to the
+    # wrong participant. The allgamedata score remains the safe fallback.
+    return ""
 
 
 def player_has_jungle_companion_hint(player):
@@ -6117,6 +6176,221 @@ class DataDragon:
         self.latest_available_version = None
         self.requested_patch_prefix = ""
 
+    @staticmethod
+    def _version_sort_key(version):
+        parts = []
+        for part in str(version or "").split("."):
+            try:
+                parts.append(int(part))
+            except ValueError:
+                parts.append(-1)
+        return tuple(parts)
+
+    @staticmethod
+    def _valid_versions(versions):
+        if not isinstance(versions, list):
+            return []
+        return [
+            str(version).strip()
+            for version in versions
+            if isinstance(version, str)
+            and str(version).strip()
+        ]
+
+    @staticmethod
+    def _valid_static_bundle(items, champions, runes, expected_version=None):
+        item_data = items.get("data") if isinstance(items, dict) else None
+        champion_data = (
+            champions.get("data") if isinstance(champions, dict) else None
+        )
+        expected_version = str(expected_version or "")
+        if expected_version:
+            for payload in (items, champions):
+                payload_version = str(
+                    payload.get("version", "")
+                    if isinstance(payload, dict)
+                    else ""
+                )
+                if payload_version and payload_version != expected_version:
+                    return False
+        if not isinstance(item_data, dict) or not item_data:
+            return False
+        if not isinstance(champion_data, dict) or not champion_data:
+            return False
+        if not isinstance(runes, list) or not runes:
+            return False
+        return any(
+            isinstance(rune, dict)
+            and rune.get("id")
+            and rune.get("name")
+            for style in runes
+            if isinstance(style, dict)
+            for slot in (style.get("slots") or [])
+            if isinstance(slot, dict)
+            for rune in (slot.get("runes") or [])
+        )
+
+    @staticmethod
+    def _catalog_paths(version):
+        version = str(version or "")
+        return (
+            META_CACHE_DIR / f"item-{version}.json",
+            META_CACHE_DIR / f"champion-{version}.json",
+            META_CACHE_DIR / f"runesReforged-{version}.json",
+        )
+
+    @staticmethod
+    def _bundle_marker_path(version):
+        return META_CACHE_DIR / f"static-{str(version or '')}.json"
+
+    def has_complete_static_data(self, version=None):
+        expected = str(version or self.version or "")
+        return bool(
+            expected
+            and self.version == expected
+            and self.items_version == expected
+            and self.champions_version == expected
+            and self.runes_version == expected
+            and self.item_data
+            and self.champion_data
+            and self.rune_name_to_id
+        )
+
+    def _apply_static_bundle(self, version, items, champions, runes):
+        if not self._valid_static_bundle(
+            items,
+            champions,
+            runes,
+            expected_version=version,
+        ):
+            return False
+
+        staged = DataDragon()
+        staged.version = str(version)
+        staged.items_version = str(version)
+        staged.item_data = dict(items.get("data") or {})
+        staged._rebuild_item_name_index()
+
+        staged.champions_version = str(version)
+        staged.champion_data = dict(champions.get("data") or {})
+        for key, champion in staged.champion_data.items():
+            champion = champion if isinstance(champion, dict) else {}
+            champion_id = str(champion.get("key", ""))
+            champion_name = champion.get("name") or key
+            if champion_id:
+                staged.champion_id_to_name[champion_id] = champion_name
+            staged.champion_name_to_key[normalize_name(champion_name)] = key
+            staged.champion_name_to_key[normalize_name(key)] = key
+
+        staged.runes_version = str(version)
+        staged.rune_styles = list(runes)
+        for style in staged.rune_styles:
+            if not isinstance(style, dict):
+                continue
+            try:
+                style_id = int(style.get("id", 0) or 0)
+            except (TypeError, ValueError):
+                style_id = 0
+            style_name = str(style.get("name", "") or "")
+            if style_id and style_name:
+                staged.rune_style_name_to_id[normalize_name(style_name)] = style_id
+            for slot_index, slot in enumerate(style.get("slots") or []):
+                if not isinstance(slot, dict):
+                    continue
+                for rune in slot.get("runes") or []:
+                    if not isinstance(rune, dict):
+                        continue
+                    try:
+                        rune_id = int(rune.get("id", 0) or 0)
+                    except (TypeError, ValueError):
+                        rune_id = 0
+                    rune_name = str(rune.get("name", "") or "")
+                    rune_key = normalize_name(rune_name)
+                    if rune_id and rune_key:
+                        staged.rune_name_to_id[rune_key] = rune_id
+                        staged.rune_id_to_name[rune_id] = rune_name
+                        staged.rune_name_to_style_id[rune_key] = style_id
+                        staged.rune_name_to_slot_index[rune_key] = slot_index
+
+        if not staged.has_complete_static_data(version):
+            return False
+
+        for name in (
+            "version",
+            "items_version",
+            "item_data",
+            "item_name_to_id",
+            "champions_version",
+            "champion_data",
+            "champion_id_to_name",
+            "champion_name_to_key",
+            "runes_version",
+            "rune_styles",
+            "rune_name_to_id",
+            "rune_id_to_name",
+            "rune_name_to_style_id",
+            "rune_name_to_slot_index",
+            "rune_style_name_to_id",
+        ):
+            setattr(self, name, getattr(staged, name))
+        return True
+
+    def _read_cached_static_bundle(self, version):
+        marker_path = self._bundle_marker_path(version)
+        if marker_path.exists():
+            marker = load_json(marker_path, {})
+            if (
+                not isinstance(marker, dict)
+                or marker.get("version") != str(version)
+                or marker.get("complete") is not True
+            ):
+                return None
+        item_path, champion_path, rune_path = self._catalog_paths(version)
+        items = load_json(item_path, None)
+        champions = load_json(champion_path, None)
+        runes = load_json(rune_path, None)
+        if not self._valid_static_bundle(
+            items,
+            champions,
+            runes,
+            expected_version=version,
+        ):
+            return None
+        return items, champions, runes
+
+    def cached_static_versions(self):
+        versions = self._valid_versions(
+            load_json(META_CACHE_DIR / "versions.json", [])
+        )
+        item_versions = {
+            path.name[len("item-"):-len(".json")]
+            for path in META_CACHE_DIR.glob("item-*.json")
+        }
+        champion_versions = {
+            path.name[len("champion-"):-len(".json")]
+            for path in META_CACHE_DIR.glob("champion-*.json")
+        }
+        rune_versions = {
+            path.name[len("runesReforged-"):-len(".json")]
+            for path in META_CACHE_DIR.glob("runesReforged-*.json")
+        }
+        complete = item_versions & champion_versions & rune_versions
+        ordered = [version for version in versions if version in complete]
+        remaining = sorted(
+            complete - set(ordered),
+            key=self._version_sort_key,
+            reverse=True,
+        )
+        return ordered + remaining
+
+    def load_cached_static_data(self, version=None):
+        candidates = [str(version)] if version else self.cached_static_versions()
+        for candidate_version in candidates:
+            bundle = self._read_cached_static_bundle(candidate_version)
+            if bundle and self._apply_static_bundle(candidate_version, *bundle):
+                return candidate_version
+        return None
+
     def resolve_version(self, game_version=""):
         prefix = patch_prefix_from_game_version(game_version)
         self.requested_patch_prefix = prefix
@@ -6124,14 +6398,15 @@ class DataDragon:
         versions = None
 
         try:
-            versions = fetch_json(f"{DDRAGON_BASE}/api/versions.json")
-            cached_versions.write_text(json.dumps(versions), encoding="utf-8")
+            versions = self._valid_versions(
+                fetch_json(f"{DDRAGON_BASE}/api/versions.json")
+            )
+            if versions:
+                written, error = write_json_atomic(cached_versions, versions)
+                if not written:
+                    raise OSError(error)
         except Exception:
-            if cached_versions.exists():
-                try:
-                    versions = json.loads(cached_versions.read_text(encoding="utf-8"))
-                except Exception:
-                    versions = None
+            versions = self._valid_versions(load_json(cached_versions, []))
 
         if not versions:
             return self.version
@@ -6150,10 +6425,53 @@ class DataDragon:
     def load_static_data(self, version):
         if not version:
             return False
-        items_ok = self.load_items(version)
-        champs_ok = self.load_champions(version)
-        runes_ok = self.load_runes(version)
-        return items_ok or champs_ok or runes_ok
+        if self.has_complete_static_data(version):
+            return True
+        bundle = self._read_cached_static_bundle(version)
+        if bundle:
+            return self._apply_static_bundle(version, *bundle)
+
+        try:
+            items = fetch_json(
+                f"{DDRAGON_BASE}/cdn/{version}/data/en_US/item.json"
+            )
+            champions = fetch_json(
+                f"{DDRAGON_BASE}/cdn/{version}/data/en_US/champion.json"
+            )
+            runes = fetch_json(
+                f"{DDRAGON_BASE}/cdn/{version}/data/en_US/runesReforged.json"
+            )
+        except Exception:
+            return False
+
+        if not self._valid_static_bundle(
+            items,
+            champions,
+            runes,
+            expected_version=version,
+        ):
+            return False
+
+        paths = self._catalog_paths(version)
+        payloads = (items, champions, runes)
+        marker_path = self._bundle_marker_path(version)
+        marker_written, _marker_error = write_json_atomic(
+            marker_path,
+            {"version": str(version), "complete": False},
+        )
+        if not marker_written:
+            return False
+        for path, payload in zip(paths, payloads):
+            written, _error = write_json_atomic(path, payload)
+            if not written:
+                return False
+        marker_written, _marker_error = write_json_atomic(
+            marker_path,
+            {"version": str(version), "complete": True},
+        )
+        if not marker_written:
+            return False
+        return self._apply_static_bundle(version, items, champions, runes)
 
     def load_items(self, version):
         if self.item_data and self.items_version == version:
@@ -6163,13 +6481,11 @@ class DataDragon:
         payload = None
         try:
             payload = fetch_json(f"{DDRAGON_BASE}/cdn/{version}/data/en_US/item.json")
-            cache.write_text(json.dumps(payload), encoding="utf-8")
+            written, error = write_json_atomic(cache, payload)
+            if not written:
+                raise OSError(error)
         except Exception:
-            if cache.exists():
-                try:
-                    payload = json.loads(cache.read_text(encoding="utf-8"))
-                except Exception:
-                    payload = None
+            payload = load_json(cache, None)
 
         if not payload:
             return False
@@ -6246,13 +6562,11 @@ class DataDragon:
         payload = None
         try:
             payload = fetch_json(f"{DDRAGON_BASE}/cdn/{version}/data/en_US/champion.json")
-            cache.write_text(json.dumps(payload), encoding="utf-8")
+            written, error = write_json_atomic(cache, payload)
+            if not written:
+                raise OSError(error)
         except Exception:
-            if cache.exists():
-                try:
-                    payload = json.loads(cache.read_text(encoding="utf-8"))
-                except Exception:
-                    payload = None
+            payload = load_json(cache, None)
 
         if not payload:
             return False
@@ -6297,23 +6611,11 @@ class DataDragon:
             payload = fetch_json(
                 f"{DDRAGON_BASE}/cdn/{version}/data/en_US/runesReforged.json"
             )
-            cache.write_text(
-                json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
+            written, error = write_json_atomic(cache, payload)
+            if not written:
+                raise OSError(error)
         except Exception:
-            if cache.exists():
-                try:
-                    payload = json.loads(
-                        cache.read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                except Exception:
-                    payload = None
+            payload = load_json(cache, None)
 
         if not isinstance(
             payload,
@@ -6489,8 +6791,9 @@ class DataDragon:
             return None
         item_id = str(item_id)
         path = ITEM_CACHE_DIR / self.version / f"{item_id}.png"
-        if path.exists() and path.stat().st_size > 100:
-            return path
+        cached = self.cached_item_icon_path(item_id)
+        if cached:
+            return cached
         try:
             download_file(
                 f"{DDRAGON_BASE}/cdn/{self.version}/img/item/{item_id}.png",
@@ -6500,6 +6803,17 @@ class DataDragon:
         except Exception:
             return None
 
+    def cached_item_icon_path(self, item_id):
+        if not self.version or not item_id:
+            return None
+        path = ITEM_CACHE_DIR / self.version / f"{item_id}.png"
+        try:
+            if path.exists() and path.stat().st_size > 100:
+                return path
+        except OSError:
+            return None
+        return None
+
     def champion_icon_path(self, champion_name):
         if not self.version or not champion_name:
             return None
@@ -6507,8 +6821,9 @@ class DataDragon:
         if not key:
             return None
         path = CHAMP_CACHE_DIR / self.version / f"{key}.png"
-        if path.exists() and path.stat().st_size > 100:
-            return path
+        cached = self.cached_champion_icon_path(champion_name)
+        if cached:
+            return cached
         try:
             download_file(
                 f"{DDRAGON_BASE}/cdn/{self.version}/img/champion/{key}.png",
@@ -6517,6 +6832,20 @@ class DataDragon:
             return path
         except Exception:
             return None
+
+    def cached_champion_icon_path(self, champion_name):
+        if not self.version or not champion_name:
+            return None
+        key = self.champion_name_to_key.get(normalize_name(champion_name))
+        if not key:
+            return None
+        path = CHAMP_CACHE_DIR / self.version / f"{key}.png"
+        try:
+            if path.exists() and path.stat().st_size > 100:
+                return path
+        except OSError:
+            return None
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -9406,24 +9735,18 @@ def choose_meta_rune_profile(
 
 
 
-def find_active_player(data):
-    active = data.get("activePlayer") or {}
-    active_ids = {
-        normalize_name(active.get("riotId")),
-        normalize_name(active.get("summonerName")),
-        normalize_name(active.get("riotIdGameName")),
-    }
-    active_ids.discard("")
+def resolve_active_player(data):
+    data = data if isinstance(data, dict) else {}
+    return resolve_player_identity(
+        data.get("activePlayer") or {},
+        data.get("allPlayers") or [],
+    )
 
-    for player in data.get("allPlayers") or []:
-        candidates = {
-            normalize_name(player.get("riotId")),
-            normalize_name(player.get("summonerName")),
-            normalize_name(player.get("riotIdGameName")),
-        }
-        if active_ids & candidates:
-            return player
-    return None
+
+def find_active_player(data):
+    """Compatibility wrapper for callers that only need the matched row."""
+    resolution = resolve_active_player(data)
+    return resolution.candidate if resolution.matched else None
 
 
 def visible_team_names(team_entries, dd):
@@ -10620,6 +10943,7 @@ def riot_league_entries_by_puuid(
     puuid,
     platform,
     api_key,
+    cancel_event=None,
 ):
     host = riot_platform_host(
         platform
@@ -10632,6 +10956,7 @@ def riot_league_entries_by_puuid(
     return riot_api_json(
         url,
         api_key,
+        cancel_event=cancel_event,
     )
 
 
@@ -11160,6 +11485,7 @@ def rank_progress_net_change_text(
 def record_rank_progress_snapshot(
     riot_id,
     rank_snapshot,
+    account_puuid="",
 ):
     """
     Persist actual rank snapshots across RiftSense versions.
@@ -11182,22 +11508,16 @@ def record_rank_progress_snapshot(
     if not solo and not flex:
         return False
 
-    payload = load_json(
-        RANK_PROGRESS_PATH,
-        [],
-    )
-    if not isinstance(
-        payload,
-        list,
-    ):
-        payload = []
-
     entry = {
         "captured_at": datetime.now().isoformat(
             timespec="seconds"
         ),
         "riot_id": str(
             riot_id
+            or ""
+        ),
+        "account_puuid": str(
+            account_puuid
             or ""
         ),
         "solo": dict(
@@ -11214,51 +11534,44 @@ def record_rank_progress_snapshot(
         ) else None,
     }
 
-    if payload:
-        last = payload[
-            -1
-        ]
-        if (
-            str(
-                last.get(
-                    "riot_id",
-                    "",
-                )
-            )
-            == entry[
-                "riot_id"
-            ]
-            and last.get(
-                "solo"
-            )
-            == entry[
-                "solo"
-            ]
-            and last.get(
-                "flex"
-            )
-            == entry[
-                "flex"
-            ]
-        ):
-            return False
+    changed = False
 
-    payload.append(
-        entry
-    )
-    # Rank points are only written when the rank snapshot changes.
-    # Keep a long archive so General > Rank Progress can show 1Y / ALL views.
-    payload = payload[
-        -2000:
-    ]
-    return write_json_atomic(
+    def append_if_changed(payload):
+        nonlocal changed
+        if not isinstance(payload, list):
+            payload = []
+        if payload:
+            last = payload[-1]
+            same_account = bool(
+                entry["account_puuid"]
+                and str(last.get("account_puuid", ""))
+                == entry["account_puuid"]
+            ) or (
+                not entry["account_puuid"]
+                and str(last.get("riot_id", "")) == entry["riot_id"]
+            )
+            if (
+                same_account
+                and last.get("solo") == entry["solo"]
+                and last.get("flex") == entry["flex"]
+            ):
+                return payload
+        changed = True
+        return [*payload, entry][-2000:]
+
+    ok, error = update_json(
         RANK_PROGRESS_PATH,
-        payload,
+        append_if_changed,
+        [],
     )
+    if not ok:
+        return False, error
+    return (True, "") if changed else False
 
 
 def load_rank_progress(
     riot_id="",
+    account_puuid="",
 ):
     payload = load_json(
         RANK_PROGRESS_PATH,
@@ -11274,19 +11587,26 @@ def load_rank_progress(
         riot_id
         or ""
     ).strip()
-    if not riot_id:
+    account_puuid = str(
+        account_puuid
+        or ""
+    ).strip()
+    if not riot_id and not account_puuid:
         return payload
 
     return [
         row
         for row in payload
-        if str(
-            row.get(
-                "riot_id",
-                "",
-            )
-        ).strip()
-        == riot_id
+        if (
+            account_puuid
+            and str(row.get("account_puuid", "")).strip()
+            == account_puuid
+        )
+        or (
+            not str(row.get("account_puuid", "")).strip()
+            and riot_id
+            and str(row.get("riot_id", "")).strip() == riot_id
+        )
     ]
 
 
@@ -11717,29 +12037,46 @@ def update_role_tier_cache_entry(
     role,
     entry,
 ):
-    payload = load_role_tier_cache()
-    payload[
-        str(
-            role
-            or ""
-        ).upper()
-    ] = entry
-    return save_role_tier_cache(
-        payload
+    role_key = str(
+        role
+        or ""
+    ).upper()
+
+    def apply_entry(payload):
+        if not isinstance(payload, dict):
+            payload = {}
+        payload[role_key] = entry
+        return payload
+
+    return update_json(
+        ROLE_TIER_CACHE_PATH,
+        apply_entry,
+        {},
     )
 
 
 RIOT_PUBLIC_CLIENT = RiotPublicClient(
     user_agent=f"RiftSense/{APP_VERSION_LABEL}",
+    log=log_warning,
 )
+
+
+def _cancel_event_is_set(event):
+    return bool(event is not None and event.is_set())
 
 
 def riot_api_json(
     url: str,
     api_key: str,
     timeout: float = 12.0,
+    cancel_event=None,
 ):
-    return RIOT_PUBLIC_CLIENT.get_json(url, api_key, timeout=timeout)
+    return RIOT_PUBLIC_CLIENT.get_json(
+        url,
+        api_key,
+        timeout=timeout,
+        cancel_event=cancel_event,
+    )
 
 
 def riot_api_status_hint(status) -> str:
@@ -11759,6 +12096,7 @@ def riot_account_by_riot_id(
     riot_id,
     route,
     api_key,
+    cancel_event=None,
 ):
     riot_id = (riot_id or "").strip()
     if "#" not in riot_id:
@@ -11784,6 +12122,7 @@ def riot_account_by_riot_id(
     data, status, _headers = riot_api_json(
         url,
         api_key,
+        cancel_event=cancel_event,
     )
 
     if status == 200 and data.get("puuid"):
@@ -11804,6 +12143,7 @@ def riot_match_ids_page(
     count=100,
     queue_id=None,
     start_time=None,
+    cancel_event=None,
 ):
     host = riot_route_host(route)
 
@@ -11833,6 +12173,7 @@ def riot_match_ids_page(
     return riot_api_json(
         url,
         api_key,
+        cancel_event=cancel_event,
     )
 
 
@@ -11840,6 +12181,7 @@ def riot_match_detail(
     match_id,
     route,
     api_key,
+    cancel_event=None,
 ):
     host = riot_route_host(route)
     url = (
@@ -11850,6 +12192,7 @@ def riot_match_detail(
     return riot_api_json(
         url,
         api_key,
+        cancel_event=cancel_event,
     )
 
 
@@ -12731,19 +13074,40 @@ def load_riot_history_index():
 
 
 def save_riot_history_index(rows):
-    tmp = RIOT_HISTORY_INDEX_PATH.with_suffix(
-        ".json.tmp"
-    )
-    tmp.write_text(
-        json.dumps(
-            rows,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    tmp.replace(
-        RIOT_HISTORY_INDEX_PATH
+    incoming = [
+        row
+        for row in (rows or [])
+        if isinstance(row, dict)
+    ]
+
+    def merge_rows(current):
+        current = current if isinstance(current, list) else []
+        merged = {
+            str(row.get("match_id")): row
+            for row in current
+            if isinstance(row, dict) and row.get("match_id")
+        }
+        without_match_id = [
+            row
+            for row in current
+            if isinstance(row, dict) and not row.get("match_id")
+        ]
+        for row in incoming:
+            match_id = str(row.get("match_id") or "")
+            if match_id:
+                merged[match_id] = row
+            elif row not in without_match_id:
+                without_match_id.append(row)
+        return sorted(
+            [*merged.values(), *without_match_id],
+            key=lambda row: int(row.get("game_creation_ms", 0) or 0),
+            reverse=True,
+        )
+
+    return update_json(
+        RIOT_HISTORY_INDEX_PATH,
+        merge_rows,
+        [],
     )
 
 
@@ -12841,12 +13205,37 @@ class App(tk.Tk):
         ).upper()
 
         self.dd = DataDragon()
+        self.dd.load_cached_static_data()
         self.lcu = LCUClient(
             SETTINGS,
             user_agent=f"RiftSense/{APP_VERSION_LABEL}",
             log_warning=log_warning,
         )
         self.photo_cache = {}
+        self._icon_work_queue = queue.Queue()
+        self._icon_result_queue = queue.Queue()
+        self._icon_pending = {}
+        self._icon_failures = {}
+        self._icon_watch_job = None
+        self._icon_shutdown = False
+        self._icon_workers = []
+        for worker_index in range(3):
+            worker = threading.Thread(
+                target=self._icon_worker_loop,
+                name=f"RiftIconWorker-{worker_index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            self._icon_workers.append(worker)
+        self._static_refresh_queue = queue.Queue()
+        self._static_refresh_generation = 0
+        self._static_refresh_active_generation = None
+        self._static_refresh_in_flight = False
+        self._static_refresh_pending = None
+        self._static_refresh_watch_job = None
+        self._static_refresh_shutdown = False
+        self._static_refresh_game_version = ""
+        self._static_refresh_last_failure = 0.0
         self.current_item_signature = None
         self.build_signature = None
         self.adaptive_signature = None
@@ -12895,6 +13284,10 @@ class App(tk.Tk):
         self.high_dpi_dense = False
 
         self._poll_queue = queue.Queue(maxsize=2)
+        self._poll_state_lock = threading.Lock()
+        self._poll_generation = 0
+        self._poll_active_generation = None
+        self._poll_shutdown = False
         self._poll_in_flight = False
         self._poll_started_at = 0.0
         self._poll_watch_job = None
@@ -12904,8 +13297,13 @@ class App(tk.Tk):
         # V27 Riot history-sync state.
         self._riot_sync_thread = None
         self._riot_sync_cancel = threading.Event()
+        self._riot_request_cancel = threading.Event()
         self._riot_sync_queue = queue.Queue()
         self._riot_sync_watch_job = None
+        self._riot_sync_generation = 0
+        self._riot_sync_active_generation = None
+        self._riot_sync_context = threading.local()
+        self._riot_sync_terminal_lock = threading.Lock()
         self._riot_history_refresh_callback = None
 
         # V38 rune-import state.
@@ -12916,6 +13314,7 @@ class App(tk.Tk):
         self._rune_import_generation = 0
         self._rune_import_draft_active = False
         self._rune_import_shutdown = False
+        self._rune_import_session_identity = None
         self.last_rune_import_signature = None
         self.current_rune_champion = ""
         self.current_rune_role = ""
@@ -12928,7 +13327,7 @@ class App(tk.Tk):
         self.event_vars = []
         self.live_api_ok = False
         self.last_patch_check = 0.0
-        self.patch_status_text = "-"
+        self.patch_status_text = self.dd.version or "-"
         self.stable_adaptive_by_champion = {}
         self.meta_refresh_inflight = set()
         self._meta_refresh_queue = queue.Queue()
@@ -12950,6 +13349,13 @@ class App(tk.Tk):
         self._general_rank_refresh_last_attempt = 0.0
         self._general_rank_queue = queue.Queue()
         self._general_rank_watch_job = None
+        self._general_rank_thread = None
+        self._general_rank_generation = 0
+        self._general_rank_active_generation = None
+        self._riot_api_test_generation = 0
+        self._riot_api_test_active_generation = None
+        self._verify_sync_generation = 0
+        self._verify_sync_active_generation = None
         self.tier_list_refresh_inflight = set()
         self.tier_list_icon_inflight = set()
         self.tier_list_result_queue = queue.Queue()
@@ -12992,10 +13398,12 @@ class App(tk.Tk):
         )
         self.bind("<Configure>", self._schedule_responsive_split, add="+")
 
-        # Load current Data Dragon data once on startup. Cached data is used if offline.
-        version = self.dd.resolve_version("")
-        if version:
-            self.dd.load_static_data(version)
+        # The UI starts from a coherent local cache (if available). Remote
+        # version/catalog checks begin only after Tk has finished construction.
+        self.after(
+            40,
+            lambda: self._request_static_data_refresh(""),
+        )
 
         self.after(
             320,
@@ -17417,8 +17825,9 @@ class App(tk.Tk):
         patch_key = self.dd.version or "current"
         cache_path = CLIENT_ITEM_CACHE_DIR / patch_key / f"{item_id}.png"
 
-        if cache_path.exists() and cache_path.stat().st_size > 100:
-            return cache_path
+        cached = self.cached_current_item_icon_path(item_id)
+        if cached:
+            return cached
 
         # League Client game-data assets reflect the installed client build.
         raw, status = self.lcu.get_bytes(
@@ -17438,17 +17847,268 @@ class App(tk.Tk):
 
         return self.dd.item_icon_path(item_id)
 
+    def cached_current_item_icon_path(self, item_id):
+        """Resolve an item icon from disk without performing network I/O."""
+        if not item_id:
+            return None
+        item_id = str(item_id)
+        patch_key = self.dd.version or "current"
+        cache_path = CLIENT_ITEM_CACHE_DIR / patch_key / f"{item_id}.png"
+        try:
+            if cache_path.exists() and cache_path.stat().st_size > 100:
+                return cache_path
+        except OSError:
+            pass
+        return None
+
+    def _icon_worker_loop(self):
+        """Acquire missing icon files without touching Tk from this thread."""
+        while True:
+            request = self._icon_work_queue.get()
+            if request is None:
+                return
+            if self._icon_shutdown:
+                continue
+
+            request_key, icon_kind, asset_id = request
+            path = None
+            error = ""
+            try:
+                if icon_kind == "champion":
+                    path = self.dd.champion_icon_path(asset_id)
+                else:
+                    path = self.current_item_icon_path(asset_id)
+                if path is None:
+                    path = self._cached_icon_path(icon_kind, asset_id)
+                if path is None:
+                    error = "no icon data was available"
+            except Exception as exc:
+                error = str(exc)
+
+            if self._icon_shutdown:
+                continue
+            self._icon_result_queue.put_nowait(
+                (request_key, path, error)
+            )
+
+    def _cached_icon_path(self, icon_kind, asset_id):
+        if icon_kind == "champion":
+            return self.dd.cached_champion_icon_path(asset_id)
+        return self.cached_current_item_icon_path(asset_id)
+
+    def _icon_request_key(self, icon_kind, asset_id):
+        version = str(self.dd.version or "current")
+        if icon_kind == "champion":
+            normalized = normalize_name(asset_id)
+            identity = self.dd.champion_name_to_key.get(
+                normalized,
+                normalized,
+            )
+        else:
+            identity = str(asset_id or "")
+        return icon_kind, version, identity
+
+    def _apply_widget_icon(
+        self,
+        widget,
+        photo,
+        display_kind,
+        reference_attr,
+        success_config=None,
+    ):
+        try:
+            if display_kind == "canvas":
+                widget.delete("riftsense_icon_placeholder")
+                widget.delete("riftsense_async_icon")
+                widget.create_image(
+                    0,
+                    0,
+                    anchor="nw",
+                    image=photo,
+                    tags=("riftsense_async_icon",),
+                )
+            else:
+                success_config = dict(success_config or {})
+                try:
+                    widget.configure(
+                        image=photo,
+                        text="",
+                        width=0,
+                        height=0,
+                        **success_config,
+                    )
+                except tk.TclError:
+                    widget.configure(
+                        image=photo,
+                        text="",
+                        width=0,
+                        **success_config,
+                    )
+            setattr(widget, reference_attr, photo)
+            widget._riftsense_icon_photo = photo
+            return True
+        except (tk.TclError, RuntimeError):
+            return False
+
+    def _request_widget_icon(
+        self,
+        widget,
+        icon_kind,
+        asset_id,
+        target_px,
+        *,
+        circle=False,
+        ring=None,
+        ring_width=1,
+        display_kind="label",
+        reference_attr="_riftsense_icon_photo",
+        success_config=None,
+    ):
+        """Use a cached icon now or queue one acquisition for all waiters."""
+        request_token = object()
+        widget._riftsense_icon_request = request_token
+        if self._icon_shutdown or not asset_id:
+            return False
+
+        cached_path = self._cached_icon_path(icon_kind, asset_id)
+        if cached_path:
+            photo = (
+                self.load_circle_photo(
+                    cached_path,
+                    target_px=target_px,
+                    ring=ring,
+                    ring_width=ring_width,
+                )
+                if circle
+                else self.load_photo(cached_path, target_px=target_px)
+            )
+            if photo:
+                return self._apply_widget_icon(
+                    widget,
+                    photo,
+                    display_kind,
+                    reference_attr,
+                    success_config,
+                )
+            return False
+
+        request_key = self._icon_request_key(icon_kind, asset_id)
+        failed_at = self._icon_failures.get(request_key, 0.0)
+        if time.monotonic() - failed_at < 30.0:
+            return False
+
+        waiter = (
+            weakref.ref(widget),
+            request_token,
+            int(target_px),
+            bool(circle),
+            ring,
+            int(ring_width),
+            display_kind,
+            reference_attr,
+            dict(success_config or {}),
+        )
+        waiters = self._icon_pending.get(request_key)
+        if waiters is None:
+            self._icon_pending[request_key] = [waiter]
+            self._icon_work_queue.put_nowait(
+                (request_key, icon_kind, asset_id)
+            )
+        else:
+            waiters.append(waiter)
+
+        if self._icon_watch_job is None:
+            self._icon_watch_job = self.after(
+                35,
+                self._watch_icon_results,
+            )
+        return False
+
+    def _watch_icon_results(self):
+        """Create PhotoImages and update still-current widgets on Tk's thread."""
+        self._icon_watch_job = None
+        if self._icon_shutdown:
+            return
+
+        while True:
+            try:
+                request_key, path, error = self._icon_result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            waiters = self._icon_pending.pop(request_key, [])
+            if not path:
+                self._icon_failures[request_key] = time.monotonic()
+                log_warning(
+                    "Icon acquisition failed for "
+                    f"{request_key[0]} {request_key[2]}: {error or 'unknown error'}"
+                )
+                continue
+
+            self._icon_failures.pop(request_key, None)
+            for waiter in waiters:
+                (
+                    widget_ref,
+                    request_token,
+                    target_px,
+                    circle,
+                    ring,
+                    ring_width,
+                    display_kind,
+                    reference_attr,
+                    success_config,
+                ) = waiter
+                widget = widget_ref()
+                if widget is None:
+                    continue
+                try:
+                    if (
+                        not widget.winfo_exists()
+                        or getattr(widget, "_riftsense_icon_request", None)
+                        is not request_token
+                    ):
+                        continue
+                except (tk.TclError, RuntimeError):
+                    continue
+
+                photo = (
+                    self.load_circle_photo(
+                        path,
+                        target_px=target_px,
+                        ring=ring,
+                        ring_width=ring_width,
+                    )
+                    if circle
+                    else self.load_photo(path, target_px=target_px)
+                )
+                if photo:
+                    self._apply_widget_icon(
+                        widget,
+                        photo,
+                        display_kind,
+                        reference_attr,
+                        success_config,
+                    )
+
+        if self._icon_pending or not self._icon_result_queue.empty():
+            self._icon_watch_job = self.after(
+                35,
+                self._watch_icon_results,
+            )
+
     def add_champion_icon(self, parent, champion_name, subtitle=""):
         holder = ttk.Frame(parent, style="Panel.TFrame")
         holder.pack(side="left", padx=2)
 
-        path = self.dd.champion_icon_path(champion_name)
-        photo = self.load_photo(path, target_px=int(SETTINGS.get("champion_icon_px", 28)))
-        if photo:
-            label = ttk.Label(holder, image=photo, style="Panel.TLabel")
-        else:
-            label = ttk.Label(holder, text="?", style="Panel.TLabel", width=4)
+        label = ttk.Label(holder, text="?", style="Panel.TLabel", width=4)
         label.pack()
+        self._request_widget_icon(
+            label,
+            "champion",
+            champion_name,
+            int(SETTINGS.get("champion_icon_px", 28)),
+            reference_attr="_champion_photo",
+        )
 
         if subtitle:
             ttk.Label(
@@ -17464,13 +18124,15 @@ class App(tk.Tk):
         holder = ttk.Frame(parent, style="Panel.TFrame")
         holder.pack(side="left", padx=5)
 
-        path = self.current_item_icon_path(item_id)
-        photo = self.load_photo(path, target_px=28)
-        if photo:
-            label = ttk.Label(holder, image=photo, style="Panel.TLabel")
-        else:
-            label = ttk.Label(holder, text="?", style="Panel.TLabel", width=4)
+        label = ttk.Label(holder, text="?", style="Panel.TLabel", width=4)
         label.pack()
+        self._request_widget_icon(
+            label,
+            "item",
+            item_id,
+            28,
+            reference_attr="_item_photo",
+        )
 
         if position is not None:
             ttk.Label(
@@ -17698,6 +18360,184 @@ class App(tk.Tk):
                 self.events_panel.pack_forget()
 
 
+    def _start_static_data_refresh(
+        self,
+        generation,
+        game_version,
+    ):
+        self._static_refresh_in_flight = True
+        self._static_refresh_active_generation = generation
+        self._static_refresh_game_version = str(game_version or "")
+        current_version = self.dd.version
+        current_complete = self.dd.has_complete_static_data()
+
+        def worker():
+            candidate = DataDragon()
+            result = {
+                "generation": generation,
+                "candidate": None,
+                "version": "",
+                "unchanged": False,
+                "error": "",
+            }
+            try:
+                version = candidate.resolve_version(game_version)
+                result["version"] = version or ""
+                if not version:
+                    result["error"] = "No valid Data Dragon version was available."
+                elif version == current_version and current_complete:
+                    result["unchanged"] = True
+                elif candidate.load_static_data(version):
+                    result["candidate"] = candidate
+                else:
+                    result["error"] = (
+                        f"Static catalogs for Data Dragon {version} were incomplete."
+                    )
+            except Exception as exc:
+                result["error"] = str(exc)
+            self._static_refresh_queue.put_nowait(result)
+
+        threading.Thread(
+            target=worker,
+            name=f"RiftStaticData-{generation}",
+            daemon=True,
+        ).start()
+        if self._static_refresh_watch_job is None:
+            self._static_refresh_watch_job = self.after(
+                50,
+                self._watch_static_data_refresh,
+            )
+
+    def _request_static_data_refresh(self, game_version=""):
+        if self._static_refresh_shutdown:
+            return None
+        game_version = str(game_version or "")
+        request_identity = patch_prefix_from_game_version(game_version) or "latest"
+
+        if self._static_refresh_in_flight:
+            active_identity = (
+                patch_prefix_from_game_version(self._static_refresh_game_version)
+                or "latest"
+            )
+            pending_identity = (
+                (
+                    patch_prefix_from_game_version(
+                        self._static_refresh_pending[1]
+                    )
+                    or "latest"
+                )
+                if self._static_refresh_pending
+                else ""
+            )
+            if request_identity in {active_identity, pending_identity}:
+                return (
+                    self._static_refresh_pending[0]
+                    if request_identity == pending_identity
+                    else self._static_refresh_active_generation
+                )
+            self._static_refresh_generation += 1
+            self._static_refresh_pending = (
+                self._static_refresh_generation,
+                game_version,
+            )
+            return self._static_refresh_generation
+
+        if (
+            getattr(self, "_static_refresh_last_failure", 0.0)
+            and time.monotonic() - self._static_refresh_last_failure < 10.0
+        ):
+            return None
+
+        self._static_refresh_generation += 1
+        generation = self._static_refresh_generation
+        self._start_static_data_refresh(generation, game_version)
+        return generation
+
+    def _apply_static_data_candidate(self, candidate):
+        if not candidate or not candidate.has_complete_static_data():
+            return False
+        old_version = self.dd.version
+        self.dd = candidate
+        self.patch_status_text = candidate.version
+
+        # Icon requests are version-keyed. Drop waiters created against the old
+        # catalog so a late old-patch completion cannot repaint a current view.
+        if old_version != candidate.version:
+            self._icon_pending.clear()
+            self._icon_failures.clear()
+
+        self.full_build_signature = None
+        self.adaptive_signature = None
+        self.build_signature = None
+        self.draft_signature = None
+        self.enemy_inventory_signature = None
+        self.companion_signature = None
+
+        try:
+            self.update_health_bar()
+        except Exception as exc:
+            log_warning("Best-effort static-data health refresh failed: " + str(exc))
+        try:
+            if not self._poll_in_flight:
+                self.after(15, self.refresh_all)
+        except Exception as exc:
+            log_warning("Best-effort static-data UI refresh failed: " + str(exc))
+        if hasattr(self, "item_audit_status_var"):
+            self.after(
+                30,
+                lambda: self.run_recommendation_item_audit(silent=True),
+            )
+        return True
+
+    def _watch_static_data_refresh(self):
+        self._static_refresh_watch_job = None
+        if self._static_refresh_shutdown:
+            return
+
+        result = None
+        while True:
+            try:
+                candidate_result = self._static_refresh_queue.get_nowait()
+            except queue.Empty:
+                break
+            if (
+                candidate_result.get("generation")
+                == self._static_refresh_active_generation
+            ):
+                result = candidate_result
+
+        if result is None:
+            if self._static_refresh_in_flight:
+                self._static_refresh_watch_job = self.after(
+                    50,
+                    self._watch_static_data_refresh,
+                )
+            return
+
+        generation = result.get("generation")
+        self._static_refresh_in_flight = False
+        self._static_refresh_active_generation = None
+        self._static_refresh_game_version = ""
+
+        if generation == self._static_refresh_generation:
+            if result.get("unchanged"):
+                self.patch_status_text = result.get("version") or self.dd.version or "-"
+                self._static_refresh_last_failure = 0.0
+            elif result.get("candidate") is not None:
+                if self._apply_static_data_candidate(result["candidate"]):
+                    self._static_refresh_last_failure = 0.0
+            else:
+                self._static_refresh_last_failure = time.monotonic()
+                log_warning(
+                    "Data Dragon static-data refresh failed: "
+                    + str(result.get("error") or "unknown error")
+                )
+
+        pending = self._static_refresh_pending
+        self._static_refresh_pending = None
+        if pending and not self._static_refresh_shutdown:
+            self._start_static_data_refresh(*pending)
+
     def maybe_refresh_patch_data(
         self,
         game_version,
@@ -17741,6 +18581,10 @@ class App(tk.Tk):
             )
             == self.dd.version
         )
+        runes_ready = bool(
+            getattr(self.dd, "rune_name_to_id", None)
+            and getattr(self.dd, "runes_version", None) == self.dd.version
+        )
 
         # The old code returned as soon as the version string matched. If
         # load_items() had failed once, RiftSense could then keep a matching
@@ -17750,6 +18594,7 @@ class App(tk.Tk):
             version_matches
             and items_ready
             and champions_ready
+            and runes_ready
         ):
             self.patch_status_text = self.dd.version
             return
@@ -17777,38 +18622,7 @@ class App(tk.Tk):
         ):
             self.last_patch_check = now
 
-            version = (
-                self.dd.version
-                if version_matches
-                else self.dd.resolve_version(
-                    game_version
-                )
-            )
-
-            if version:
-                self.dd.load_static_data(
-                    version
-                )
-
-                # Item data arriving changes validation, ids and icon lookups.
-                # Force the build cards to recompute immediately instead of
-                # waiting for an unrelated meta/adaptive signature change.
-                if (
-                    getattr(
-                        self.dd,
-                        "item_data",
-                        None,
-                    )
-                    and getattr(
-                        self.dd,
-                        "items_version",
-                        None,
-                    )
-                    == version
-                ):
-                    self.full_build_signature = None
-                    self.adaptive_signature = None
-                    self.build_signature = None
+            self._request_static_data_refresh(game_version)
 
         version_matches = bool(
             self.dd.version
@@ -17829,15 +18643,25 @@ class App(tk.Tk):
             )
             == self.dd.version
         )
+        champions_ready = bool(
+            getattr(self.dd, "champion_data", None)
+            and getattr(self.dd, "champions_version", None) == self.dd.version
+        )
+        runes_ready = bool(
+            getattr(self.dd, "rune_name_to_id", None)
+            and getattr(self.dd, "runes_version", None) == self.dd.version
+        )
 
         if (
             version_matches
             and items_ready
+            and champions_ready
+            and runes_ready
         ):
             self.patch_status_text = self.dd.version
         elif version_matches:
             self.patch_status_text = (
-                f"{self.dd.version} • loading items"
+                f"{self.dd.version} • loading static data"
             )
         else:
             client_patch = prefix.rstrip(
@@ -18035,7 +18859,9 @@ class App(tk.Tk):
         safe_champ = re.sub(r"[^A-Za-z0-9_-]+", "_", snapshot.get("champion") or "game")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = HISTORY_DIR / f"{stamp}_{safe_champ}.json"
-        path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        ok, error = write_json_atomic(path, snapshot)
+        if not ok:
+            raise OSError(error)
         csv_path = HISTORY_DIR / "games.csv"
         new_file = not csv_path.exists()
         with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -18059,27 +18885,66 @@ class App(tk.Tk):
         self.session_started_at = None
         self.session_build_changes = []
 
-    def _riot_sync_post(self, payload):
+    def _riot_sync_post(
+        self,
+        payload,
+        *,
+        result_queue=None,
+        generation=None,
+        terminal=None,
+    ):
+        context = getattr(self, "_riot_sync_context", None)
+        if context is not None:
+            if result_queue is None:
+                result_queue = getattr(context, "result_queue", None)
+            if generation is None:
+                generation = getattr(context, "generation", None)
+            if terminal is None:
+                terminal = getattr(context, "terminal", None)
+        event_type = str(
+            (payload or {}).get("type", "event")
+        )
+        message = str(
+            (payload or {}).get("message", "") or ""
+        )
+        terminal_outcomes = {
+            "done": RiotWorkerOutcome.SUCCESS,
+            "error": RiotWorkerOutcome.FAILED,
+            "cancelled": RiotWorkerOutcome.CANCELLED,
+        }
+        if (
+            terminal is not None
+            and event_type == "done"
+            and _cancel_event_is_set(
+                getattr(self, "_riot_sync_cancel", None)
+            )
+        ):
+            event_type = "cancelled"
+            message = "Ranked history sync cancelled."
+        if terminal is not None and event_type in terminal_outcomes:
+            extra = dict(payload or {})
+            extra.pop("message", None)
+            extra["type"] = event_type
+            if not terminal.publish(
+                terminal_outcomes[event_type],
+                message,
+                **extra,
+            ):
+                return False
+        else:
+            event = dict(payload or {})
+            if generation is not None:
+                event["generation"] = int(generation)
+            try:
+                (result_queue or self._riot_sync_queue).put_nowait(event)
+            except Exception as exc:
+                log_warning(
+                    "Ranked sync result delivery failed: "
+                    + type(exc).__name__
+                )
+                return False
+
         try:
-            event_type = str(
-                (
-                    payload
-                    or {}
-                ).get(
-                    "type",
-                    "event",
-                )
-            )
-            message = str(
-                (
-                    payload
-                    or {}
-                ).get(
-                    "message",
-                    "",
-                )
-                or ""
-            )
             if message:
                 log_info(
                     f"Ranked sync • {event_type} • {message}"
@@ -18090,22 +18955,7 @@ class App(tk.Tk):
                 )
         except Exception as exc:
             log_warning("Best-effort _riot_sync_post operation failed: " + str(exc))
-
-        try:
-            self._riot_sync_queue.put_nowait(
-                payload
-            )
-        except Exception as exc:
-            log_warning("Best-effort _riot_sync_post operation failed: " + str(exc))
-
-    def _normalized_riot_id_key(
-        self,
-        riot_id,
-    ):
-        return str(
-            riot_id
-            or ""
-        ).strip().casefold()
+        return True
 
     def _history_local_identity(
         self,
@@ -18122,10 +18972,6 @@ class App(tk.Tk):
         by ACCOUNT-V1 is not enough to distinguish an auth problem from an
         endpoint/authorization problem.
         """
-        requested_key = self._normalized_riot_id_key(
-            riot_id
-        )
-
         saved = load_json(
             RIOT_ACCOUNT_PATH,
             {},
@@ -18150,21 +18996,15 @@ class App(tk.Tk):
             )
             or ""
         ).strip()
-
-        if (
+        saved_request_resolution = resolve_player_identity(
+            {"riotId": riot_id},
+            [{"riotId": saved_id}],
+            allow_weak=False,
+        )
+        saved_matches_requested = bool(
             saved_puuid
-            and saved_id
-            and self._normalized_riot_id_key(
-                saved_id
-            )
-            == requested_key
-        ):
-            return {
-                "puuid": saved_puuid,
-                "riot_id": saved_id,
-                "source": "saved account",
-                "payload": saved,
-            }
+            and saved_request_resolution.matched
+        )
 
         # Local League Client identity. Read-only localhost request only.
         try:
@@ -18222,20 +19062,55 @@ class App(tk.Tk):
             )
 
             if puuid:
+                saved_current_resolution = resolve_player_identity(
+                    {"puuid": saved_puuid, "riotId": saved_id},
+                    [payload],
+                    allow_weak=False,
+                )
+                same_saved_account = bool(
+                    saved_matches_requested
+                    and saved_current_resolution.matched
+                    and saved_current_resolution.reason == "PUUID_EXACT"
+                )
+                requested_current_resolution = resolve_player_identity(
+                    {"riotId": riot_id},
+                    [payload],
+                    allow_weak=False,
+                )
+
                 # If the client supplies a full Riot ID, refuse to silently use
-                # a different logged-in account.
+                # a different logged-in account. A renamed Riot ID is accepted
+                # only when the persisted PUUID proves it is the same account.
                 if (
                     game_name
                     and tag_line
-                    and self._normalized_riot_id_key(
-                        resolved_id
-                    )
-                    != requested_key
+                    and not requested_current_resolution.matched
+                    and not same_saved_account
                 ):
                     return {
                         "error": (
                             "League Client is logged in as "
                             f"{resolved_id}, but Settings contains {riot_id}."
+                        ),
+                        "source": "League Client",
+                    }
+
+                # Older clients may expose only displayName. If persisted PUUID
+                # evidence contradicts the current LCU PUUID, a weak display
+                # name is not allowed to select the account.
+                if (
+                    not (game_name and tag_line)
+                    and saved_matches_requested
+                    and saved_current_resolution.reason == "PUUID_CONFLICT"
+                ):
+                    log_warning(
+                        "Identity conflict: persisted PUUID disagrees with "
+                        "League Client identity; weak display name ignored."
+                    )
+                    return {
+                        "error": (
+                            "League Client account identity conflicts with "
+                            "the saved Riot account. Verify the Riot ID in Settings."
                         ),
                         "source": "League Client",
                     }
@@ -18251,6 +19126,20 @@ class App(tk.Tk):
                     "payload": payload,
                 }
 
+        # The saved identity remains a safe offline fallback only after the
+        # currently logged-in client (when available) has had a chance to
+        # confirm an account switch or same-PUUID Riot ID rename.
+        if (
+            saved_puuid
+            and saved_matches_requested
+        ):
+            return {
+                "puuid": saved_puuid,
+                "riot_id": saved_id,
+                "source": "saved account",
+                "payload": saved,
+            }
+
         return None
 
     def _riot_history_sync_worker(
@@ -18261,6 +19150,8 @@ class App(tk.Tk):
         api_key,
         queue_ids,
         history_scope,
+        generation=None,
+        result_queue=None,
     ):
         """
         Sync Summoner's Rift ranked matches for the selected history scope.
@@ -18268,7 +19159,32 @@ class App(tk.Tk):
         Normal Draft, Quickplay, ARAM, Arena and custom games are always excluded.
         The default V38 scope is the full 2026 ranked year (S1-S3).
         """
+        if generation is None:
+            generation = int(
+                getattr(self, "_riot_sync_active_generation", 0) or 0
+            )
+        result_queue = result_queue or self._riot_sync_queue
+        terminal = RiotWorkerTerminal(
+            result_queue,
+            generation,
+            "ranked history sync",
+            log=log_warning,
+        )
+        context = getattr(self, "_riot_sync_context", None)
+        if context is None:
+            context = threading.local()
+            self._riot_sync_context = context
+        context.result_queue = result_queue
+        context.generation = generation
+        context.terminal = terminal
+
         try:
+            if self._riot_sync_cancel.is_set():
+                self._riot_sync_post({
+                    "type": "cancelled",
+                    "message": "Ranked history sync cancelled.",
+                })
+                return
             season = current_ranked_season()
             scope_info = ranked_history_scope_info(
                 history_scope
@@ -18363,9 +19279,16 @@ class App(tk.Tk):
                     riot_id,
                     route,
                     api_key,
+                    cancel_event=self._riot_sync_cancel,
                 )
 
                 if not account:
+                    if self._riot_sync_cancel.is_set():
+                        self._riot_sync_post({
+                            "type": "cancelled",
+                            "message": "Ranked history sync cancelled.",
+                        })
+                        return
                     error_text = str(
                         error
                         or "Forbidden"
@@ -18424,6 +19347,7 @@ class App(tk.Tk):
                 puuid,
                 platform,
                 api_key,
+                cancel_event=self._riot_sync_cancel,
             )
             if rank_status == 200:
                 rank_snapshot = normalize_rank_snapshot(
@@ -18443,6 +19367,7 @@ class App(tk.Tk):
                 record_rank_progress_snapshot(
                     resolved_id,
                     rank_snapshot,
+                    puuid,
                 )
                 self._riot_sync_post({
                     "type": "rank",
@@ -18454,6 +19379,12 @@ class App(tk.Tk):
                     ),
                 })
             else:
+                if self._riot_sync_cancel.is_set():
+                    self._riot_sync_post({
+                        "type": "cancelled",
+                        "message": "Ranked history sync cancelled.",
+                    })
+                    return
                 rank_message = (
                     (rank_data.get("status") or {}).get(
                         "message"
@@ -18486,14 +19417,35 @@ class App(tk.Tk):
                     })
                     return
 
-            RIOT_ACCOUNT_PATH.write_text(
-                json.dumps(
-                    account_state,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
+            worker_account_updates = {
+                key: account_state[key]
+                for key in (
+                    "riot_id",
+                    "puuid",
+                    "history_scope",
+                    "history_scope_key",
+                    "queue_ids",
+                )
+                if key in account_state
+            }
+            if rank_status == 200:
+                worker_account_updates.update({
+                    key: account_state[key]
+                    for key in (
+                        "rank_snapshot",
+                        "rank_updated_at",
+                        "rank_source",
+                    )
+                    if key in account_state
+                })
+            account_ok, account_error = update_riot_account(
+                lambda current: (
+                    current.update(worker_account_updates)
+                    or current
+                )
             )
+            if not account_ok:
+                raise OSError(account_error)
 
             queue_text = ", ".join(
                 season["queues"].get(
@@ -18524,7 +19476,7 @@ class App(tk.Tk):
                 )
 
                 while not self._riot_sync_cancel.is_set():
-                    data, page_status, headers = riot_match_ids_page(
+                    data, page_status, _headers = riot_match_ids_page(
                         puuid,
                         route,
                         api_key,
@@ -18532,35 +19484,12 @@ class App(tk.Tk):
                         count=100,
                         queue_id=queue_id,
                         start_time=scope_info["start_epoch"],
+                        cancel_event=self._riot_sync_cancel,
                     )
 
-                    if page_status == 429:
-                        retry = float(
-                            headers.get(
-                                "Retry-After",
-                                "2",
-                            )
-                            or 2
-                        )
-                        self._riot_sync_post({
-                            "type": "status",
-                            "message": (
-                                f"Riot rate limit reached. "
-                                f"Waiting {retry:.0f}s..."
-                            ),
-                        })
-                        time.sleep(
-                            min(
-                                max(
-                                    retry,
-                                    1.0,
-                                ),
-                                120.0,
-                            )
-                        )
-                        continue
-
                     if page_status != 200:
+                        if self._riot_sync_cancel.is_set():
+                            break
                         message = (
                             (data.get("status") or {}).get(
                                 "message"
@@ -18616,7 +19545,8 @@ class App(tk.Tk):
                     if len(page) < 100:
                         break
 
-                    time.sleep(1.25)
+                    if self._riot_sync_cancel.wait(1.25):
+                        break
 
             if self._riot_sync_cancel.is_set():
                 self._riot_sync_post({
@@ -18659,39 +19589,12 @@ class App(tk.Tk):
                 if self._riot_sync_cancel.is_set():
                     break
 
-                while not self._riot_sync_cancel.is_set():
-                    data, match_status, headers = riot_match_detail(
-                        match_id,
-                        route,
-                        api_key,
-                    )
-
-                    if match_status == 429:
-                        retry = float(
-                            headers.get(
-                                "Retry-After",
-                                "2",
-                            )
-                            or 2
-                        )
-                        self._riot_sync_post({
-                            "type": "status",
-                            "message": (
-                                f"Rate limit: waiting {retry:.0f}s • "
-                                f"{downloaded:,}/{total_missing:,} new ranked matches"
-                            ),
-                        })
-                        time.sleep(
-                            min(
-                                max(
-                                    retry,
-                                    1.0,
-                                ),
-                                120.0,
-                            )
-                        )
-                        continue
-                    break
+                data, match_status, _headers = riot_match_detail(
+                    match_id,
+                    route,
+                    api_key,
+                    cancel_event=self._riot_sync_cancel,
+                )
 
                 if self._riot_sync_cancel.is_set():
                     break
@@ -18716,13 +19619,12 @@ class App(tk.Tk):
                             RIOT_HISTORY_DIR
                             / f"{match_id}.json"
                         )
-                        raw_path.write_text(
-                            json.dumps(
-                                data,
-                                ensure_ascii=False,
-                            ),
-                            encoding="utf-8",
+                        raw_written, raw_error = write_json_atomic(
+                            raw_path,
+                            data,
                         )
+                        if not raw_written:
+                            raise OSError(raw_error)
                         existing_by_id[
                             match_id
                         ] = summary
@@ -18786,15 +19688,38 @@ class App(tk.Tk):
                     })
                     return
                 else:
+                    all_rows = sorted(
+                        existing_by_id.values(),
+                        key=lambda row: int(
+                            row.get("game_creation_ms", 0) or 0
+                        ),
+                        reverse=True,
+                    )
+                    save_riot_history_index(all_rows)
+                    status_info = data.get("status") if isinstance(data, dict) else {}
+                    category = (
+                        status_info.get("category", "OTHER_PERMANENT_ERROR")
+                        if isinstance(status_info, dict)
+                        else "OTHER_PERMANENT_ERROR"
+                    )
+                    message = (
+                        status_info.get("message", "")
+                        if isinstance(status_info, dict)
+                        else ""
+                    )
                     self._riot_sync_post({
-                        "type": "status",
+                        "type": "error",
                         "message": (
-                            f"Skipped {match_id} "
-                            f"(HTTP {match_status})."
+                            f"Ranked history sync stopped after {downloaded:,}/"
+                            f"{total_missing:,} new match details. Partial results "
+                            f"were preserved; {match_id} failed "
+                            f"({category}, HTTP {match_status}): {message}"
                         ),
                     })
+                    return
 
-                time.sleep(1.25)
+                if self._riot_sync_cancel.wait(1.25):
+                    break
 
             all_rows = sorted(
                 existing_by_id.values(),
@@ -18821,62 +19746,124 @@ class App(tk.Tk):
                 )
             ]
 
-            account_state["last_sync_at"] = (
-                datetime.now().isoformat(
+            terminal_lock = getattr(
+                self, "_riot_sync_terminal_lock", None
+            )
+            if terminal_lock is None:
+                terminal_lock = threading.Lock()
+                self._riot_sync_terminal_lock = terminal_lock
+            with terminal_lock:
+                if self._riot_sync_cancel.is_set():
+                    self._riot_sync_post({
+                        "type": "cancelled",
+                        "message": (
+                            f"Sync cancelled. "
+                            f"{len(scoped_rows):,} ranked matches in the selected "
+                            "scope are already stored."
+                        ),
+                    })
+                    return
+
+                last_sync_at = datetime.now().isoformat(
                     timespec="seconds"
                 )
-            )
-            RIOT_ACCOUNT_PATH.write_text(
-                json.dumps(
-                    account_state,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+                account_ok, account_error = update_riot_account(
+                    lambda current: (
+                        current.update({"last_sync_at": last_sync_at})
+                        or current
+                    )
+                )
+                if not account_ok:
+                    raise OSError(account_error)
 
-            if self._riot_sync_cancel.is_set():
                 self._riot_sync_post({
-                    "type": "cancelled",
+                    "type": "done",
                     "message": (
-                        f"Sync cancelled. "
-                        f"{len(scoped_rows):,} ranked matches in the selected "
-                        "scope are already stored."
+                        f"Sync complete: {len(scoped_rows):,} "
+                        f"{scope_info['name']} ranked matches stored "
+                        f"({queue_text})."
+                    ),
+                    "count": len(
+                        scoped_rows
                     ),
                 })
-                return
-
-            self._riot_sync_post({
-                "type": "done",
-                "message": (
-                    f"Sync complete: {len(scoped_rows):,} "
-                    f"{scope_info['name']} ranked matches stored "
-                    f"({queue_text})."
-                ),
-                "count": len(
-                    scoped_rows
-                ),
-            })
 
         except Exception as exc:
+            log_exception(
+                "Ranked history sync worker failed",
+                exc,
+            )
+            partial_rows = locals().get("existing_by_id")
+            if isinstance(partial_rows, dict):
+                try:
+                    save_riot_history_index(
+                        sorted(
+                            partial_rows.values(),
+                            key=lambda row: int(
+                                row.get("game_creation_ms", 0) or 0
+                            ),
+                            reverse=True,
+                        )
+                    )
+                except Exception as persist_exc:
+                    log_exception(
+                        "Ranked history partial-index preservation failed",
+                        persist_exc,
+                    )
             self._riot_sync_post({
                 "type": "error",
-                "message": (
-                    f"Ranked history sync error: {exc}"
-                ),
+                "message": "Ranked history sync failed unexpectedly. Open the latest log for details.",
             })
+        finally:
+            if not terminal.sent:
+                event_type = (
+                    "cancelled"
+                    if self._riot_sync_cancel.is_set()
+                    else "error"
+                )
+                message = (
+                    "Ranked history sync cancelled."
+                    if event_type == "cancelled"
+                    else "Ranked history sync ended without a terminal result."
+                )
+                self._riot_sync_post({
+                    "type": event_type,
+                    "message": message,
+                })
+            for name in ("result_queue", "generation", "terminal"):
+                try:
+                    delattr(context, name)
+                except AttributeError:
+                    pass
 
 
     def _watch_riot_sync_queue(
         self,
         status_var,
         progress_var,
+        generation=None,
+        result_queue=None,
+        worker_thread=None,
     ):
+        generation = (
+            getattr(self, "_riot_sync_active_generation", None)
+            if generation is None
+            else generation
+        )
+        result_queue = result_queue or self._riot_sync_queue
+        worker_thread = worker_thread or self._riot_sync_thread
+        if generation != getattr(self, "_riot_sync_active_generation", None):
+            return
+
+        terminal_received = False
         while True:
             try:
-                event = self._riot_sync_queue.get_nowait()
+                event = result_queue.get_nowait()
             except queue.Empty:
                 break
+
+            if event.get("generation") != generation:
+                continue
 
             event_type = event.get("type")
             message = event.get(
@@ -18929,6 +19916,9 @@ class App(tk.Tk):
                 "cancelled",
                 "error",
             }:
+                self._riot_sync_active_generation = None
+                if self._riot_sync_thread is worker_thread:
+                    self._riot_sync_thread = None
                 if event_type == "done":
                     progress_var.set(
                         100.0
@@ -18936,9 +19926,15 @@ class App(tk.Tk):
                     PERSONAL_META_SIGNAL_CACHE.clear()
                     self._history_all_rows_cache = None
                     self._history_needs_full_refresh = True
-                    self.refresh_general_page(
-                        allow_rank_refresh=False
-                    )
+                    try:
+                        self.refresh_general_page(
+                            allow_rank_refresh=False
+                        )
+                    except Exception as exc:
+                        log_exception(
+                            "Ranked sync completion UI refresh failed",
+                            exc,
+                        )
 
                 callback = getattr(
                     self,
@@ -18967,34 +19963,58 @@ class App(tk.Tk):
                 self._set_history_sync_controls(
                     False
                 )
+                terminal_received = True
+                break
 
-        thread = getattr(
-            self,
-            "_riot_sync_thread",
-            None,
-        )
+        if terminal_received:
+            if not _cancel_event_is_set(
+                getattr(self, "_riot_request_cancel", None)
+            ):
+                self._riot_sync_cancel.clear()
+            self._riot_sync_watch_job = None
+            self.update_history_sync_state_visual()
+            return
+
+        thread = worker_thread
         if thread and thread.is_alive():
             self._riot_sync_watch_job = self.after(
                 100,
                 lambda: self._watch_riot_sync_queue(
                     status_var,
                     progress_var,
+                    generation,
+                    result_queue,
+                    worker_thread,
                 ),
             )
         else:
             # Drain one last time shortly after the worker exits.
-            if not self._riot_sync_queue.empty():
+            if not result_queue.empty():
                 self._riot_sync_watch_job = self.after(
                     80,
                     lambda: self._watch_riot_sync_queue(
                         status_var,
                         progress_var,
+                        generation,
+                        result_queue,
+                        worker_thread,
                     ),
                 )
             else:
+                status_var.set(
+                    "Ranked history sync failed: worker ended without a terminal result."
+                )
                 self._set_history_sync_controls(
                     False
                 )
+                self._riot_sync_active_generation = None
+                if self._riot_sync_thread is worker_thread:
+                    self._riot_sync_thread = None
+                if not _cancel_event_is_set(
+                    getattr(self, "_riot_request_cancel", None)
+                ):
+                    self._riot_sync_cancel.clear()
+                self._riot_sync_watch_job = None
                 self.update_history_sync_state_visual()
 
     def cancel_riot_history_sync(
@@ -19009,7 +20029,8 @@ class App(tk.Tk):
             thread
             and thread.is_alive()
         ):
-            self._riot_sync_cancel.set()
+            with self._riot_sync_terminal_lock:
+                self._riot_sync_cancel.set()
             self.history_sync_status_var.set(
                 "Cancelling ranked-history sync..."
             )
@@ -19136,44 +20157,38 @@ class App(tk.Tk):
             )
             return False
 
-        saved_account = load_json(
-            RIOT_ACCOUNT_PATH,
-            {},
-        )
-        saved_account.update({
+        account_updates = {
             "riot_id": riot_id,
             "route": route,
             "platform": platform,
             "queue_ids": queue_ids,
             "history_scope_key": history_scope,
-        })
+        }
 
         # Riot ID and platform are normal persistent app preferences. API key is not.
         SETTINGS["riot_id"] = riot_id
         SETTINGS["riot_platform"] = platform
         SETTINGS["ranked_history_scope"] = history_scope
         save_settings()
-        strip_persisted_secrets(
-            saved_account
+        account_ok, account_error = update_riot_account(
+            lambda current: (
+                current.update(account_updates)
+                or current
+            )
         )
-        RIOT_ACCOUNT_PATH.write_text(
-            json.dumps(
-                saved_account,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        if not account_ok:
+            status_var.set(
+                f"Could not save Riot account state: {account_error}"
+            )
+            self._set_history_sync_controls(False)
+            return False
 
         self._riot_sync_cancel.clear()
-
-        while True:
-            try:
-                self._riot_sync_queue.get_nowait()
-            except queue.Empty:
-                break
-            except Exception:
-                break
+        self._riot_sync_generation += 1
+        generation = self._riot_sync_generation
+        self._riot_sync_active_generation = generation
+        result_queue = queue.Queue()
+        self._riot_sync_queue = result_queue
 
         progress_var.set(
             0.0
@@ -19198,15 +20213,30 @@ class App(tk.Tk):
                 api_key,
                 queue_ids,
                 history_scope,
+                generation,
+                result_queue,
             ),
             name="RiotRankedHistorySync",
             daemon=True,
         )
-        self._riot_sync_thread.start()
+        try:
+            self._riot_sync_thread.start()
+        except Exception as exc:
+            log_exception("Ranked history sync could not start", exc)
+            self._riot_sync_active_generation = None
+            self._riot_sync_thread = None
+            self._set_history_sync_controls(False)
+            status_var.set(
+                "Ranked history sync could not start. Open the latest log for details."
+            )
+            return False
 
         self._watch_riot_sync_queue(
             status_var,
             progress_var,
+            generation,
+            result_queue,
+            self._riot_sync_thread,
         )
         return True
 
@@ -21498,6 +22528,12 @@ class App(tk.Tk):
             padx=(8, 0),
         )
         self.history_perf_enemy_icon._history_photo = None
+        self._request_widget_icon(
+            self.history_perf_enemy_icon,
+            "champion",
+            None,
+            42,
+        )
 
         # Compatibility vars retained for existing backup/review logic.
         self.history_perf_opponent_var = tk.StringVar(
@@ -23992,9 +25028,10 @@ class App(tk.Tk):
         Use all stored 2026 ranked Solo/Flex games that belong to the current
         Riot account.
 
-        Legacy V27-V42 index rows did not store account_puuid. V43 remembers
-        which PUUID owns those legacy rows. If the user later changes Riot ID,
-        untagged legacy rows are not mixed into the new account's memory.
+        Legacy V27-V42 index rows did not store account_puuid. They are used
+        only when an existing memory file already records their owning PUUID;
+        uncertain legacy rows are never attached to whichever account happens
+        to be current now.
         """
         account_state = load_json(
             RIOT_ACCOUNT_PATH,
@@ -24030,13 +25067,8 @@ class App(tk.Tk):
             )
             or ""
         )
-        if (
-            not legacy_owner_puuid
-            and current_puuid
-        ):
-            legacy_owner_puuid = (
-                current_puuid
-            )
+        if not current_puuid:
+            return []
 
         rows = []
         for raw_row in load_riot_history_index():
@@ -24057,19 +25089,11 @@ class App(tk.Tk):
                 or ""
             )
 
-            if current_puuid:
-                if row_puuid:
-                    if (
-                        row_puuid
-                        != current_puuid
-                    ):
-                        continue
-                elif (
-                    legacy_owner_puuid
-                    and legacy_owner_puuid
-                    != current_puuid
-                ):
+            if row_puuid:
+                if row_puuid != current_puuid:
                     continue
+            elif legacy_owner_puuid != current_puuid:
+                continue
 
             rows.append(
                 row
@@ -25412,6 +26436,10 @@ class App(tk.Tk):
             "timestamp": memory.get(
                 "updated_at"
             ),
+            "account_puuid": str(
+                (memory.get("account", {}) or {}).get("puuid", "")
+                or ""
+            ),
             "source_fingerprint": memory.get(
                 "source_fingerprint",
                 "",
@@ -25475,44 +26503,27 @@ class App(tk.Tk):
             return False, error
 
         if record_snapshot:
-            history = load_json(
-                PERFORMANCE_HISTORY_PATH,
-                [],
-            )
-            if not isinstance(
-                history,
-                list,
-            ):
-                history = []
-
             snapshot = self._performance_snapshot(
                 memory
             )
-            last = (
-                history[-1]
-                if history
-                else {}
+
+            def append_snapshot(history):
+                history = history if isinstance(history, list) else []
+                last = history[-1] if history else {}
+                if (
+                    last.get("source_fingerprint")
+                    == snapshot.get("source_fingerprint")
+                ):
+                    return history
+                return [*history, snapshot][-500:]
+
+            history_ok, history_error = update_json(
+                PERFORMANCE_HISTORY_PATH,
+                append_snapshot,
+                [],
             )
-            if (
-                last.get(
-                    "source_fingerprint"
-                )
-                != snapshot.get(
-                    "source_fingerprint"
-                )
-            ):
-                history.append(
-                    snapshot
-                )
-                history = history[
-                    -500:
-                ]
-                history_ok, history_error = write_json_atomic(
-                    PERFORMANCE_HISTORY_PATH,
-                    history,
-                )
-                if not history_ok:
-                    return False, history_error
+            if not history_ok:
+                return False, history_error
 
         return True, ""
 
@@ -25845,6 +26856,24 @@ class App(tk.Tk):
             PERFORMANCE_HISTORY_PATH,
             [],
         )
+        account = (
+            memory.get(
+                "account",
+                {},
+            )
+            or {}
+        )
+        account_puuid = str(
+            account.get("puuid", "")
+            or ""
+        )
+        if isinstance(performance_history, list) and account_puuid:
+            performance_history = [
+                row
+                for row in performance_history
+                if str(row.get("account_puuid", "") or "")
+                == account_puuid
+            ]
         snapshot_count = (
             len(
                 performance_history
@@ -25854,13 +26883,6 @@ class App(tk.Tk):
                 list,
             )
             else 0
-        )
-        account = (
-            memory.get(
-                "account",
-                {},
-            )
-            or {}
         )
         account_text = str(
             account.get(
@@ -25913,64 +26935,25 @@ class App(tk.Tk):
         if not pattern:
             return
 
-        memory = load_json(
+        def forget_pattern(memory):
+            memory = memory if isinstance(memory, dict) else {}
+            forgotten = {
+                str(pattern_id)
+                for pattern_id in memory.get("forgotten_pattern_ids", []) or []
+            }
+            forgotten.add(str(pattern.get("id", "")))
+            memory["forgotten_pattern_ids"] = sorted(forgotten)
+            memory["patterns"] = [
+                item
+                for item in memory.get("patterns", []) or []
+                if str(item.get("id", "")) not in forgotten
+            ]
+            return memory
+
+        ok, error = update_json(
             PLAYER_MEMORY_PATH,
+            forget_pattern,
             {},
-        )
-        if not isinstance(
-            memory,
-            dict,
-        ):
-            memory = {}
-
-        forgotten = set(
-            str(
-                pattern_id
-            )
-            for pattern_id in (
-                memory.get(
-                    "forgotten_pattern_ids",
-                    [],
-                )
-                or []
-            )
-        )
-        forgotten.add(
-            str(
-                pattern.get(
-                    "id",
-                    "",
-                )
-            )
-        )
-        memory[
-            "forgotten_pattern_ids"
-        ] = sorted(
-            forgotten
-        )
-        memory[
-            "patterns"
-        ] = [
-            item
-            for item in (
-                memory.get(
-                    "patterns",
-                    []
-                )
-                or []
-            )
-            if str(
-                item.get(
-                    "id",
-                    "",
-                )
-            )
-            not in forgotten
-        ]
-
-        ok, error = self.save_player_memory(
-            memory,
-            record_snapshot=False,
         )
         if not ok:
             self.rs_error(
@@ -26011,11 +26994,12 @@ class App(tk.Tk):
             PLAYER_MEMORY_PATH,
             PERFORMANCE_HISTORY_PATH,
         ):
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception as exc:
-                log_warning("Best-effort reset_player_memory operation failed: " + str(exc))
+            deleted, delete_error = delete_json(path)
+            if not deleted:
+                log_warning(
+                    "Best-effort reset_player_memory operation failed: "
+                    + delete_error
+                )
 
         try:
             if AI_REVIEWS_DIR.exists():
@@ -27088,46 +28072,26 @@ class App(tk.Tk):
                 )
                 or "-"
             )
-            photo = None
-            try:
-                path = self.dd.champion_icon_path(
-                    row.get(
-                        "_raw_champion",
-                        champion,
-                    )
-                )
-                photo = self.load_circle_photo(
-                    path,
-                    target_px=36,
-                    ring=ACCENT,
-                    ring_width=1,
-                )
-            except Exception:
-                photo = None
-
-            if photo:
-                self.history_match_photos.append(
-                    photo
-                )
-                icon = tk.Label(
-                    card,
-                    image=photo,
-                    bg=PANEL_ALT,
-                    bd=0,
-                )
-                icon._history_photo = photo
-            else:
-                icon = tk.Label(
-                    card,
-                    text=champion[
-                        :1
-                    ].upper(),
-                    bg=DEEP_BG,
-                    fg=FG,
-                    width=3,
-                    height=2,
-                    font=ui_font(7, "bold"),
-                )
+            icon = tk.Label(
+                card,
+                text=champion[:1].upper(),
+                bg=DEEP_BG,
+                fg=FG,
+                width=3,
+                height=2,
+                font=ui_font(7, "bold"),
+            )
+            self._request_widget_icon(
+                icon,
+                "champion",
+                row.get("_raw_champion", champion),
+                36,
+                circle=True,
+                ring=ACCENT,
+                ring_width=1,
+                reference_attr="_history_photo",
+                success_config={"bg": PANEL_ALT},
+            )
             icon.grid(
                 row=0,
                 column=2,
@@ -27703,51 +28667,40 @@ class App(tk.Tk):
             )
         )
 
-        champion_path = self.dd.champion_icon_path(
-            champion
+        self.history_detail_champion_label.configure(
+            image="",
+            text="?",
+            width=5,
+            height=2,
         )
-        champion_photo = self.load_circle_photo(
-            champion_path,
-            target_px=52,
+        self.history_detail_champion_label._champion_photo = None
+        self.history_perf_ally_icon.configure(
+            image="",
+            text=str(champion)[:1].upper(),
+            width=4,
+            height=2,
+        )
+        self.history_perf_ally_icon._history_photo = None
+        self._request_widget_icon(
+            self.history_detail_champion_label,
+            "champion",
+            champion,
+            52,
+            circle=True,
             ring=ACCENT,
             ring_width=2,
+            reference_attr="_champion_photo",
         )
-        if champion_photo:
-            self.history_detail_champion_label.configure(
-                image=champion_photo,
-                text="",
-                width=0,
-                height=0,
-            )
-            self.history_detail_champion_label._champion_photo = (
-                champion_photo
-            )
-            self.history_perf_ally_icon.configure(
-                image=champion_photo,
-                text="",
-                width=0,
-                height=0,
-            )
-            self.history_perf_ally_icon._history_photo = champion_photo
-        else:
-            self.history_detail_champion_label.configure(
-                image="",
-                text="?",
-                width=5,
-                height=2,
-            )
-            self.history_detail_champion_label._champion_photo = None
-            self.history_perf_ally_icon.configure(
-                image="",
-                text=str(
-                    champion
-                )[
-                    :1
-                ].upper(),
-                width=4,
-                height=2,
-            )
-            self.history_perf_ally_icon._history_photo = None
+        self._request_widget_icon(
+            self.history_perf_ally_icon,
+            "champion",
+            champion,
+            52,
+            circle=True,
+            ring=ACCENT,
+            ring_width=2,
+            reference_attr="_history_photo",
+        )
 
         for child in self.history_detail_items_frame.winfo_children():
             child.destroy()
@@ -27785,31 +28738,23 @@ class App(tk.Tk):
                     padx=(0, 5),
                 )
 
-                path = self.current_item_icon_path(
-                    item_id
+                icon = tk.Label(
+                    holder,
+                    text="?",
+                    bg=PANEL_ALT,
+                    fg=FG,
+                    width=3,
+                    height=1,
                 )
-                photo = self.load_photo(
-                    path,
-                    target_px=32,
-                )
-                if photo:
-                    icon = tk.Label(
-                        holder,
-                        image=photo,
-                        bg=PANEL,
-                        bd=0,
-                    )
-                    icon._item_photo = photo
-                else:
-                    icon = tk.Label(
-                        holder,
-                        text="?",
-                        bg=PANEL_ALT,
-                        fg=FG,
-                        width=3,
-                        height=1,
-                    )
                 icon.pack()
+                self._request_widget_icon(
+                    icon,
+                    "item",
+                    item_id,
+                    32,
+                    reference_attr="_item_photo",
+                    success_config={"bg": PANEL},
+                )
                 Tooltip(
                     icon,
                     name,
@@ -28325,40 +29270,29 @@ class App(tk.Tk):
                 )
                 or "?"
             )
-            try:
-                enemy_path = self.dd.champion_icon_path(
-                    opponent.get(
-                        "raw_champion",
-                        enemy_champion,
-                    )
-                )
-                enemy_photo = self.load_circle_photo(
-                    enemy_path,
-                    target_px=42,
-                    ring=ACCENT,
-                    ring_width=2,
-                )
-            except Exception:
-                enemy_photo = None
-
-            if enemy_photo:
-                self.history_perf_enemy_icon.configure(
-                    image=enemy_photo,
-                    text="",
-                    width=0,
-                    height=0,
-                )
-                self.history_perf_enemy_icon._history_photo = enemy_photo
-            else:
-                self.history_perf_enemy_icon.configure(
-                    image="",
-                    text=enemy_champion[
-                        :1
-                    ].upper(),
-                    width=4,
-                    height=2,
-                )
-                self.history_perf_enemy_icon._history_photo = None
+            self.history_perf_enemy_icon.configure(
+                image="",
+                text=enemy_champion[:1].upper(),
+                width=4,
+                height=2,
+            )
+            self.history_perf_enemy_icon._history_photo = None
+            self._request_widget_icon(
+                self.history_perf_enemy_icon,
+                "champion",
+                None,
+                42,
+            )
+            self._request_widget_icon(
+                self.history_perf_enemy_icon,
+                "champion",
+                opponent.get("raw_champion", enemy_champion),
+                42,
+                circle=True,
+                ring=ACCENT,
+                ring_width=2,
+                reference_attr="_history_photo",
+            )
 
             # Compatibility vars for existing review/debug paths.
             self.history_perf_opponent_var.set(
@@ -29386,43 +30320,29 @@ class App(tk.Tk):
                 f"{most_games} games • {most_wr:.0f}% WR"
             )
 
-            try:
-                most_path = self.dd.champion_icon_path(
-                    most_played[
-                        0
-                    ]
-                )
-                most_photo = self.load_circle_photo(
-                    most_path,
-                    target_px=40,
-                    ring=ACCENT,
-                    ring_width=2,
-                )
-            except Exception:
-                most_photo = None
-
-            if most_photo:
-                self.history_most_icon_label.configure(
-                    image=most_photo,
-                    text="",
-                    width=0,
-                    height=0,
-                )
-                self.history_most_icon_label._history_photo = most_photo
-            else:
-                self.history_most_icon_label.configure(
-                    image="",
-                    text=str(
-                        most_played[
-                            0
-                        ]
-                    )[
-                        :1
-                    ].upper(),
-                    width=4,
-                    height=2,
-                )
-                self.history_most_icon_label._history_photo = None
+            self.history_most_icon_label.configure(
+                image="",
+                text=str(most_played[0])[:1].upper(),
+                width=4,
+                height=2,
+            )
+            self.history_most_icon_label._history_photo = None
+            self._request_widget_icon(
+                self.history_most_icon_label,
+                "champion",
+                None,
+                40,
+            )
+            self._request_widget_icon(
+                self.history_most_icon_label,
+                "champion",
+                most_played[0],
+                40,
+                circle=True,
+                ring=ACCENT,
+                ring_width=2,
+                reference_attr="_history_photo",
+            )
         else:
             self.history_most_name_var.set(
                 "-"
@@ -30460,33 +31380,48 @@ class App(tk.Tk):
                 or ""
             ).strip()
 
+        self._general_rank_generation += 1
+        generation = self._general_rank_generation
+        self._general_rank_active_generation = generation
+        result_queue = queue.Queue()
+        self._general_rank_queue = result_queue
+        terminal = RiotWorkerTerminal(
+            result_queue,
+            generation,
+            "general rank refresh",
+            log=log_warning,
+        )
+
         def worker():
-            errors = []
-
-            # Prefer the supported Riot Web API when the user already entered a
-            # session key in Settings > Riot & Sync.
-            if (
-                api_key
-                and riot_id
-            ):
-                try:
-                    account_state = load_json(
-                        RIOT_ACCOUNT_PATH,
-                        {},
+            try:
+                if _cancel_event_is_set(
+                    getattr(self, "_riot_request_cancel", None)
+                ):
+                    terminal.publish(
+                        RiotWorkerOutcome.CANCELLED,
+                        "Rank refresh cancelled.",
                     )
-                    if not isinstance(
-                        account_state,
-                        dict,
-                    ):
-                        account_state = {}
+                    return
 
-                    puuid = str(
-                        account_state.get(
-                            "puuid",
-                            "",
-                        )
-                        or ""
-                    ).strip()
+                errors = []
+                local_identity = (
+                    self._history_local_identity(riot_id)
+                    if riot_id
+                    else None
+                )
+
+                # Prefer the supported Riot Web API when the user already entered a
+                # session key in Settings > Riot & Sync.
+                if api_key and riot_id:
+                    puuid = ""
+                    if (
+                        isinstance(local_identity, dict)
+                        and not local_identity.get("error")
+                    ):
+                        puuid = str(
+                            local_identity.get("puuid", "")
+                            or ""
+                        ).strip()
 
                     if not puuid:
                         account, account_status, account_error = (
@@ -30494,6 +31429,7 @@ class App(tk.Tk):
                                 riot_id,
                                 route,
                                 api_key,
+                                cancel_event=self._riot_request_cancel,
                             )
                         )
                         if account:
@@ -30519,20 +31455,21 @@ class App(tk.Tk):
                                 puuid,
                                 platform,
                                 api_key,
+                                cancel_event=self._riot_request_cancel,
                             )
                         )
                         if rank_status == 200:
-                            self._general_rank_queue.put_nowait(
-                                (
-                                    {
-                                        "kind": "riot",
-                                        "source": "Riot API",
-                                        "payload": rank_data,
-                                        "puuid": puuid,
-                                    },
-                                    200,
-                                    "",
-                                )
+                            terminal.publish(
+                                RiotWorkerOutcome.SUCCESS,
+                                "Rank refresh completed.",
+                                payload={
+                                    "kind": "riot",
+                                    "source": "Riot API",
+                                    "payload": rank_data,
+                                    "puuid": puuid,
+                                },
+                                status=200,
+                                error="",
                             )
                             return
 
@@ -30563,92 +31500,193 @@ class App(tk.Tk):
                                 )
                             )
                         )
-                except Exception as exc:
-                    errors.append(
-                        f"Riot API: {exc}"
-                    )
 
-            # Local fallback. Riot documents the League Client API as
-            # unsupported, so it must not be the only refresh path.
-            try:
-                lcu_payload, lcu_status = self.lcu.get(
-                    "/lol-ranked/v1/current-ranked-stats",
-                    timeout=1.2,
-                )
-                if lcu_status == 200:
-                    self._general_rank_queue.put_nowait(
-                        (
-                            {
-                                "kind": "lcu",
-                                "source": "League Client",
-                                "payload": lcu_payload,
-                            },
-                            200,
-                            " • ".join(
-                                errors
-                            ),
-                        )
+                if _cancel_event_is_set(
+                    getattr(self, "_riot_request_cancel", None)
+                ):
+                    terminal.publish(
+                        RiotWorkerOutcome.CANCELLED,
+                        "Rank refresh cancelled.",
                     )
                     return
 
-                errors.append(
-                    f"League Client HTTP {lcu_status or '-'}"
-                )
-            except Exception as exc:
-                errors.append(
-                    f"League Client: {exc}"
-                )
-
-            try:
-                self._general_rank_queue.put_nowait(
-                    (
-                        {
-                            "kind": "none",
-                            "source": "",
-                            "payload": None,
-                        },
-                        None,
-                        " • ".join(
-                            errors
-                        ),
+                # Local fallback. Riot documents the League Client API as
+                # unsupported, so it must not be the only refresh path. It is
+                # adopted only when the current LCU account was safely linked
+                # to the configured/saved identity.
+                if (
+                    not isinstance(local_identity, dict)
+                    or local_identity.get("error")
+                    or not local_identity.get("puuid")
+                    or local_identity.get("source") != "League Client"
+                ):
+                    errors.append(
+                        "League Client identity is unavailable or conflicts with Settings"
                     )
-                )
+                    local_identity = None
+                try:
+                    if local_identity is None:
+                        lcu_payload, lcu_status = None, None
+                    else:
+                        lcu_payload, lcu_status = self.lcu.get(
+                            "/lol-ranked/v1/current-ranked-stats",
+                            timeout=1.2,
+                        )
+                except Exception as exc:
+                    errors.append(
+                        f"League Client: {exc}"
+                    )
+                else:
+                    if lcu_status == 200:
+                        terminal.publish(
+                            RiotWorkerOutcome.SUCCESS,
+                            "Rank refresh completed.",
+                            payload={
+                                "kind": "lcu",
+                                "source": "League Client",
+                                "payload": lcu_payload,
+                                "puuid": str(
+                                    local_identity.get("puuid", "")
+                                    or ""
+                                ),
+                            },
+                            status=200,
+                            error=" • ".join(errors),
+                        )
+                        return
+
+                    errors.append(
+                        f"League Client HTTP {lcu_status or '-'}"
+                    )
             except Exception as exc:
-                log_warning("Best-effort worker operation failed: " + str(exc))
+                log_exception(
+                    "General rank refresh worker failed",
+                    exc,
+                )
+                terminal.publish(
+                    RiotWorkerOutcome.FAILED,
+                    "Rank refresh failed unexpectedly.",
+                    payload={
+                        "kind": "none",
+                        "source": "",
+                        "payload": None,
+                    },
+                    status=None,
+                    error="Rank refresh failed unexpectedly. Open the latest log for details.",
+                )
+            else:
+                terminal.publish(
+                    RiotWorkerOutcome.FAILED,
+                    "Rank refresh unavailable.",
+                    payload={
+                        "kind": "none",
+                        "source": "",
+                        "payload": None,
+                    },
+                    status=None,
+                    error=" • ".join(errors),
+                )
+            finally:
+                if not terminal.sent:
+                    outcome = (
+                        RiotWorkerOutcome.CANCELLED
+                        if _cancel_event_is_set(
+                            getattr(self, "_riot_request_cancel", None)
+                        )
+                        else RiotWorkerOutcome.FAILED
+                    )
+                    terminal.publish(
+                        outcome,
+                        (
+                            "Rank refresh cancelled."
+                            if outcome == RiotWorkerOutcome.CANCELLED
+                            else "Rank refresh ended without a terminal result."
+                        ),
+                        payload={"kind": "none", "source": "", "payload": None},
+                        status=None,
+                        error="Rank refresh did not complete.",
+                    )
 
-        if self._general_rank_watch_job is None:
-            self._general_rank_watch_job = self.after(
-                80,
-                self._watch_general_rank_refresh,
-            )
-
-        threading.Thread(
+        self._general_rank_thread = threading.Thread(
             target=worker,
             name="RiftRankRefresh",
             daemon=True,
-        ).start()
+        )
+        worker_thread = self._general_rank_thread
+        try:
+            self._general_rank_thread.start()
+        except Exception as exc:
+            log_exception("General rank refresh could not start", exc)
+            self._general_rank_refresh_inflight = False
+            self._general_rank_active_generation = None
+            self._general_rank_thread = None
+            self._general_rank_watch_job = None
+            self._general_rank_refresh_done(
+                {"kind": "none", "source": "", "payload": None},
+                None,
+                "Rank refresh could not start.",
+            )
+            return
+        if self._general_rank_watch_job is None:
+            self._general_rank_watch_job = self.after(
+                80,
+                lambda: self._watch_general_rank_refresh(
+                    generation,
+                    result_queue,
+                    worker_thread,
+                ),
+            )
 
 
     def _watch_general_rank_refresh(
         self,
+        generation=None,
+        result_queue=None,
+        worker_thread=None,
     ):
+        generation = (
+            self._general_rank_active_generation
+            if generation is None
+            else generation
+        )
+        result_queue = result_queue or self._general_rank_queue
+        worker_thread = worker_thread or self._general_rank_thread
+        if generation != self._general_rank_active_generation:
+            return
         self._general_rank_watch_job = None
 
         try:
-            payload, status, error = self._general_rank_queue.get_nowait()
+            result = result_queue.get_nowait()
         except queue.Empty:
-            if self._general_rank_refresh_inflight:
+            if worker_thread and worker_thread.is_alive():
                 self._general_rank_watch_job = self.after(
                     90,
-                    self._watch_general_rank_refresh,
+                    lambda: self._watch_general_rank_refresh(
+                        generation,
+                        result_queue,
+                        worker_thread,
+                    ),
                 )
+                return
+            result = {
+                "outcome": RiotWorkerOutcome.FAILED.value,
+                "generation": generation,
+                "payload": {"kind": "none", "source": "", "payload": None},
+                "status": None,
+                "error": "Rank refresh worker ended without a terminal result.",
+            }
+
+        if result.get("generation") != generation:
             return
 
         self._general_rank_refresh_inflight = False
+        self._general_rank_active_generation = None
+        if self._general_rank_thread is worker_thread:
+            self._general_rank_thread = None
         self._general_rank_refresh_done(
-            payload,
-            status,
-            error,
+            result.get("payload"),
+            result.get("status"),
+            result.get("error", result.get("message", "")),
         )
 
     def _general_rank_refresh_done(
@@ -30723,58 +31761,9 @@ class App(tk.Tk):
                 "flex"
             )
         ):
-            account_state = load_json(
-                RIOT_ACCOUNT_PATH,
-                {},
-            )
-            if not isinstance(
-                account_state,
-                dict,
-            ):
-                account_state = {}
-
-            previous = (
-                account_state.get(
-                    "rank_snapshot",
-                    {},
-                )
-                or {}
-            )
-            merged = {
-                "solo": (
-                    parsed.get(
-                        "solo"
-                    )
-                    or previous.get(
-                        "solo"
-                    )
-                ),
-                "flex": (
-                    parsed.get(
-                        "flex"
-                    )
-                    or previous.get(
-                        "flex"
-                    )
-                ),
-            }
-
             updated_at = datetime.now().isoformat(
                 timespec="seconds"
             )
-            account_state[
-                "rank_snapshot"
-            ] = merged
-            account_state[
-                "rank_updated_at"
-            ] = updated_at
-            account_state[
-                "rank_source"
-            ] = (
-                source
-                or "Rank refresh"
-            )
-
             puuid = str(
                 wrapper.get(
                     "puuid",
@@ -30782,39 +31771,47 @@ class App(tk.Tk):
                 )
                 or ""
             ).strip()
-            if puuid:
-                account_state[
-                    "puuid"
-                ] = puuid
+            persisted = {}
 
-            riot_id = str(
-                SETTINGS.get(
-                    "riot_id",
-                    "",
-                )
-                or account_state.get(
-                    "riot_id",
-                    "",
-                )
-                or ""
-            ).strip()
-            if riot_id:
-                account_state[
-                    "riot_id"
-                ] = riot_id
+            def apply_rank(current):
+                previous = current.get("rank_snapshot", {}) or {}
+                merged = {
+                    "solo": parsed.get("solo") or previous.get("solo"),
+                    "flex": parsed.get("flex") or previous.get("flex"),
+                }
+                riot_id = str(
+                    SETTINGS.get("riot_id", "")
+                    or current.get("riot_id", "")
+                    or ""
+                ).strip()
+                current.update({
+                    "rank_snapshot": merged,
+                    "rank_updated_at": updated_at,
+                    "rank_source": source or "Rank refresh",
+                })
+                if puuid:
+                    current["puuid"] = puuid
+                if riot_id:
+                    current["riot_id"] = riot_id
+                persisted.update({"merged": merged, "riot_id": riot_id})
+                return current
 
-            strip_persisted_secrets(
-                account_state
+            account_ok, account_error = update_riot_account(
+                apply_rank,
             )
-            write_json_atomic(
-                RIOT_ACCOUNT_PATH,
-                account_state,
-            )
+            if not account_ok:
+                log_warning(
+                    "Rank refresh could not persist account state: "
+                    + account_error
+                )
+            merged = persisted.get("merged", parsed)
+            riot_id = persisted.get("riot_id", "")
 
             if riot_id:
                 record_rank_progress_snapshot(
                     riot_id,
                     merged,
+                    puuid,
                 )
 
             if hasattr(
@@ -31090,6 +32087,7 @@ class App(tk.Tk):
             record_rank_progress_snapshot(
                 riot_id,
                 rank_snapshot,
+                str(account_state.get("puuid", "") or ""),
             )
 
         history_wins = sum(
@@ -32988,7 +33986,8 @@ class App(tk.Tk):
             or ""
         ).strip()
         progress = load_rank_progress(
-            riot_id
+            riot_id,
+            self._history_account_puuid(),
         )
         all_solo_points = []
         for row in progress:
@@ -36670,25 +37669,38 @@ class App(tk.Tk):
 
     def _watch_riot_api_test_queue(
         self,
+        generation=None,
+        result_queue=None,
+        worker_thread=None,
     ):
-        queue_obj = getattr(
-            self,
-            "_riot_api_test_queue",
-            None,
+        generation = (
+            getattr(self, "_riot_api_test_active_generation", None)
+            if generation is None
+            else generation
         )
+        queue_obj = result_queue or getattr(self, "_riot_api_test_queue", None)
         if queue_obj is None:
             return
+        worker_thread = worker_thread or getattr(
+            self, "_riot_api_test_thread", None
+        )
+        if generation != getattr(self, "_riot_api_test_active_generation", None):
+            return
 
-        message = None
+        result = None
         try:
-            while True:
-                message = queue_obj.get_nowait()
+            result = queue_obj.get_nowait()
         except queue.Empty:
-            pass
+            result = None
         except Exception as exc:
             log_warning("Best-effort _watch_riot_api_test_queue operation failed: " + str(exc))
 
-        if message is not None:
+        if result is not None and result.get("generation") == generation:
+            message = str(result.get("message", ""))
+            self._riot_api_test_active_generation = None
+            if getattr(self, "_riot_api_test_thread", None) is worker_thread:
+                self._riot_api_test_thread = None
+            self._riot_api_test_job = None
             self.last_riot_api_diagnostic = str(
                 message
             )
@@ -36704,38 +37716,32 @@ class App(tk.Tk):
                 )
             except Exception as exc:
                 log_warning("Best-effort _watch_riot_api_test_queue operation failed: " + str(exc))
-            self._riot_api_test_job = None
             return
 
-        thread = getattr(
-            self,
-            "_riot_api_test_thread",
-            None,
-        )
+        thread = worker_thread
         if (
             thread
             and thread.is_alive()
         ):
             self._riot_api_test_job = self.after(
                 80,
-                self._watch_riot_api_test_queue,
+                lambda: self._watch_riot_api_test_queue(
+                    generation,
+                    queue_obj,
+                    thread,
+                ),
             )
         else:
-            try:
-                message = queue_obj.get_nowait()
-            except Exception:
-                message = None
-
-            if message is not None:
-                self.history_sync_status_var.set(
-                    str(
-                        message
-                    )
-                )
-            else:
-                self.history_sync_status_var.set(
-                    "API TEST ERROR • Worker returned no result. Open Settings → Diagnostics → Open Latest Log."
-                )
+            message = (
+                "API TEST ERROR • Worker returned no terminal result. "
+                "Open Settings → Diagnostics → Open Latest Log."
+            )
+            self._riot_api_test_active_generation = None
+            if getattr(self, "_riot_api_test_thread", None) is thread:
+                self._riot_api_test_thread = None
+            self._riot_api_test_job = None
+            self.last_riot_api_diagnostic = message
+            self.history_sync_status_var.set(message)
 
             try:
                 self.setting_test_api_button.configure(
@@ -36744,7 +37750,6 @@ class App(tk.Tk):
                 )
             except Exception as exc:
                 log_warning("Best-effort _watch_riot_api_test_queue operation failed: " + str(exc))
-            self._riot_api_test_job = None
 
     def test_riot_api_access(
         self,
@@ -36797,7 +37802,19 @@ class App(tk.Tk):
             except Exception as exc:
                 log_warning("Best-effort test_riot_api_access operation failed: " + str(exc))
 
-        self._riot_api_test_queue = queue.Queue()
+        self._riot_api_test_generation = (
+            getattr(self, "_riot_api_test_generation", 0) + 1
+        )
+        generation = self._riot_api_test_generation
+        self._riot_api_test_active_generation = generation
+        result_queue = queue.Queue()
+        self._riot_api_test_queue = result_queue
+        terminal = RiotWorkerTerminal(
+            result_queue,
+            generation,
+            "Riot API diagnostic",
+            log=log_warning,
+        )
 
         try:
             self.setting_test_api_button.configure(
@@ -36813,18 +37830,22 @@ class App(tk.Tk):
 
         def finish(
             message,
+            outcome=RiotWorkerOutcome.FAILED,
         ):
-            try:
-                self._riot_api_test_queue.put_nowait(
-                    str(
-                        message
-                    )
-                )
-            except Exception as exc:
-                log_warning("Best-effort finish operation failed: " + str(exc))
+            if _cancel_event_is_set(
+                getattr(self, "_riot_request_cancel", None)
+            ):
+                outcome = RiotWorkerOutcome.CANCELLED
+                message = "API TEST CANCELLED"
+            return terminal.publish(outcome, message)
 
         def worker():
             try:
+                if _cancel_event_is_set(
+                    getattr(self, "_riot_request_cancel", None)
+                ):
+                    finish("API TEST CANCELLED", RiotWorkerOutcome.CANCELLED)
+                    return
                 identity = self._history_local_identity(
                     riot_id
                 )
@@ -36874,6 +37895,7 @@ class App(tk.Tk):
                             riot_id,
                             route,
                             api_key,
+                            cancel_event=self._riot_request_cancel,
                         )
                     )
                     if not account:
@@ -36903,6 +37925,7 @@ class App(tk.Tk):
                         puuid,
                         platform,
                         api_key,
+                        cancel_event=self._riot_request_cancel,
                     )
                 )
                 league_message = (
@@ -36942,6 +37965,7 @@ class App(tk.Tk):
                     count=1,
                     queue_id=420,
                     start_time=None,
+                    cancel_event=self._riot_request_cancel,
                 )
                 match_message = (
                     (
@@ -36966,7 +37990,8 @@ class App(tk.Tk):
                         (
                             f"API TEST OK • PUUID via {source} • "
                             "League-V4 HTTP 200 • Match-V5 HTTP 200"
-                        )
+                        ),
+                        RiotWorkerOutcome.SUCCESS,
                     )
                 else:
                     finish(
@@ -36984,31 +38009,67 @@ class App(tk.Tk):
                     exc,
                 )
                 finish(
-                    "API TEST ERROR • "
-                    + str(exc)
+                    "API TEST ERROR • Unexpected diagnostic failure. "
+                    "Open the latest log for details."
                 )
+            finally:
+                if not terminal.sent:
+                    finish(
+                        "API TEST ERROR • Worker ended without a terminal result."
+                    )
 
         self._riot_api_test_thread = threading.Thread(
             target=worker,
             name="RiftApiDiagnostic",
             daemon=True,
         )
-        self._riot_api_test_thread.start()
+        worker_thread = self._riot_api_test_thread
+        try:
+            self._riot_api_test_thread.start()
+        except Exception as exc:
+            log_exception("Riot API diagnostic could not start", exc)
+            self._riot_api_test_active_generation = None
+            self._riot_api_test_thread = None
+            self._riot_api_test_job = None
+            try:
+                self.setting_test_api_button.configure(
+                    text="Test API",
+                    state="normal",
+                )
+                self.history_sync_status_var.set(
+                    "API TEST ERROR • Diagnostic worker could not start."
+                )
+            except Exception as ui_exc:
+                log_exception("Riot API diagnostic start cleanup failed", ui_exc)
+            return
         self._riot_api_test_job = self.after(
             80,
-            self._watch_riot_api_test_queue,
+            lambda: self._watch_riot_api_test_queue(
+                generation,
+                result_queue,
+                worker_thread,
+            ),
         )
 
 
     def _watch_verify_sync_queue(
         self,
+        generation=None,
+        result_queue=None,
+        worker_thread=None,
     ):
-        queue_obj = getattr(
-            self,
-            "_verify_sync_queue",
-            None,
+        generation = (
+            getattr(self, "_verify_sync_active_generation", None)
+            if generation is None
+            else generation
         )
+        queue_obj = result_queue or getattr(self, "_verify_sync_queue", None)
         if queue_obj is None:
+            return
+        worker_thread = worker_thread or getattr(
+            self, "_verify_sync_thread", None
+        )
+        if generation != getattr(self, "_verify_sync_active_generation", None):
             return
 
         result = None
@@ -37020,21 +38081,25 @@ class App(tk.Tk):
             result = None
 
         if result is None:
-            thread = getattr(
-                self,
-                "_verify_sync_thread",
-                None,
-            )
+            thread = worker_thread
             if (
                 thread
                 and thread.is_alive()
             ):
                 self._verify_sync_job = self.after(
                     80,
-                    self._watch_verify_sync_queue,
+                    lambda: self._watch_verify_sync_queue(
+                        generation,
+                        queue_obj,
+                        thread,
+                    ),
                 )
                 return
 
+            self._verify_sync_active_generation = None
+            if getattr(self, "_verify_sync_thread", None) is thread:
+                self._verify_sync_thread = None
+            self._verify_sync_job = None
             self.history_sync_status_var.set(
                 "VERIFY SYNC • Verification worker ended without a result."
             )
@@ -37045,7 +38110,9 @@ class App(tk.Tk):
                 )
             except Exception as exc:
                 log_warning("Best-effort _watch_verify_sync_queue operation failed: " + str(exc))
-            self._verify_sync_job = None
+            return
+
+        if result.get("generation") != generation:
             return
 
         ok = bool(
@@ -37069,6 +38136,9 @@ class App(tk.Tk):
                 else "VERIFY SYNC FAILED"
             )
         )
+        self._verify_sync_active_generation = None
+        if getattr(self, "_verify_sync_thread", None) is worker_thread:
+            self._verify_sync_thread = None
 
         if not ok:
             self.history_sync_status_var.set(
@@ -37090,9 +38160,6 @@ class App(tk.Tk):
             or "VERIFY SYNC OK • starting real ranked sync..."
         )
 
-        started = self.start_ranked_sync_from_settings(
-            auto=True
-        )
         try:
             self.setting_verify_sync_button.configure(
                 text="Verify & Sync",
@@ -37100,6 +38167,20 @@ class App(tk.Tk):
             )
         except Exception as exc:
             log_warning("Best-effort _watch_verify_sync_queue operation failed: " + str(exc))
+
+        try:
+            started = self.start_ranked_sync_from_settings(
+                auto=True
+            )
+        except Exception as exc:
+            log_exception(
+                "Verify and sync completion callback failed",
+                exc,
+            )
+            started = False
+            self.history_sync_status_var.set(
+                "VERIFY SYNC OK • real sync could not be started."
+            )
 
         if not started:
             if not self.history_sync_status_var.get():
@@ -37183,25 +38264,47 @@ class App(tk.Tk):
             "VERIFY SYNC • Resolving PUUID..."
         )
 
-        self._verify_sync_queue = queue.Queue()
+        self._verify_sync_generation = (
+            getattr(self, "_verify_sync_generation", 0) + 1
+        )
+        generation = self._verify_sync_generation
+        self._verify_sync_active_generation = generation
+        result_queue = queue.Queue()
+        self._verify_sync_queue = result_queue
+        terminal = RiotWorkerTerminal(
+            result_queue,
+            generation,
+            "verify and sync",
+            log=log_warning,
+        )
 
         def finish(
             ok,
             message,
         ):
-            try:
-                self._verify_sync_queue.put_nowait({
-                    "ok": bool(
-                        ok
-                    ),
-                    "message": str(
-                        message
-                    ),
-                })
-            except Exception as exc:
-                log_warning("Best-effort finish operation failed: " + str(exc))
+            outcome = (
+                RiotWorkerOutcome.SUCCESS
+                if ok
+                else RiotWorkerOutcome.FAILED
+            )
+            if _cancel_event_is_set(
+                getattr(self, "_riot_request_cancel", None)
+            ):
+                outcome = RiotWorkerOutcome.CANCELLED
+                ok = False
+                message = "VERIFY SYNC CANCELLED"
+            return terminal.publish(
+                outcome,
+                message,
+                ok=bool(ok),
+            )
 
-        def worker():
+        def run_workflow():
+            if _cancel_event_is_set(
+                getattr(self, "_riot_request_cancel", None)
+            ):
+                finish(False, "VERIFY SYNC CANCELLED")
+                return
             identity = self._history_local_identity(
                 riot_id
             )
@@ -37253,6 +38356,7 @@ class App(tk.Tk):
                     riot_id,
                     route,
                     api_key,
+                    cancel_event=self._riot_request_cancel,
                 )
                 if not account:
                     finish(
@@ -37281,6 +38385,7 @@ class App(tk.Tk):
                     puuid,
                     platform,
                     api_key,
+                    cancel_event=self._riot_request_cancel,
                 )
             )
             if league_status != 200:
@@ -37324,6 +38429,7 @@ class App(tk.Tk):
                 count=1,
                 queue_id=tested_queue,
                 start_time=None,
+                cancel_event=self._riot_request_cancel,
             )
 
             if match_status != 200:
@@ -37373,6 +38479,7 @@ class App(tk.Tk):
                     first_match_id,
                     route,
                     api_key,
+                    cancel_event=self._riot_request_cancel,
                 )
 
                 if (
@@ -37421,12 +38528,50 @@ class App(tk.Tk):
                 ),
             )
 
+        def worker():
+            try:
+                run_workflow()
+            except Exception as exc:
+                log_exception(
+                    "Verify and sync worker failed",
+                    exc,
+                )
+                finish(
+                    False,
+                    "VERIFY SYNC FAILED • Unexpected verification failure. "
+                    "Open the latest log for details.",
+                )
+            finally:
+                if not terminal.sent:
+                    finish(
+                        False,
+                        "VERIFY SYNC FAILED • Worker ended without a terminal result.",
+                    )
+
         self._verify_sync_thread = threading.Thread(
             target=worker,
             name="RiftVerifySync",
             daemon=True,
         )
-        self._verify_sync_thread.start()
+        worker_thread = self._verify_sync_thread
+        try:
+            self._verify_sync_thread.start()
+        except Exception as exc:
+            log_exception("Verify and sync worker could not start", exc)
+            self._verify_sync_active_generation = None
+            self._verify_sync_thread = None
+            self._verify_sync_job = None
+            try:
+                self.setting_verify_sync_button.configure(
+                    text="Verify & Sync",
+                    state="normal",
+                )
+                self.history_sync_status_var.set(
+                    "VERIFY SYNC FAILED • Verification worker could not start."
+                )
+            except Exception as ui_exc:
+                log_exception("Verify and sync start cleanup failed", ui_exc)
+            return
 
         if getattr(
             self,
@@ -37442,7 +38587,11 @@ class App(tk.Tk):
 
         self._verify_sync_job = self.after(
             80,
-            self._watch_verify_sync_queue,
+            lambda: self._watch_verify_sync_queue(
+                generation,
+                result_queue,
+                worker_thread,
+            ),
         )
 
     def save_integrated_settings(self, silent=False):
@@ -37639,32 +38788,21 @@ class App(tk.Tk):
                 riot_route
             )
 
-        account_state = load_json(
-            RIOT_ACCOUNT_PATH,
-            {},
-        )
-        if not isinstance(
-            account_state,
-            dict,
-        ):
-            account_state = {}
-        account_state["riot_id"] = riot_id
-        account_state["platform"] = riot_platform
-        account_state["route"] = riot_route
-        strip_persisted_secrets(
-            account_state
-        )
-        try:
-            RIOT_ACCOUNT_PATH.write_text(
-                json.dumps(
-                    account_state,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
+        account_ok, account_error = update_riot_account(
+            lambda current: (
+                current.update({
+                    "riot_id": riot_id,
+                    "platform": riot_platform,
+                    "route": riot_route,
+                })
+                or current
             )
-        except Exception as exc:
-            log_warning("Best-effort save_integrated_settings operation failed: " + str(exc))
+        )
+        if not account_ok:
+            log_warning(
+                "Best-effort save_integrated_settings operation failed: "
+                + account_error
+            )
 
         self.apply_runtime_settings()
 
@@ -37715,151 +38853,13 @@ class App(tk.Tk):
         self,
         destination,
     ):
-        destination = Path(
-            destination
+        return create_backup(
+            _backup_layout(),
+            Path(destination),
+            application_version=APP_VERSION,
+            transform_json=_sanitize_backup_json,
+            virtual_settings=SETTINGS,
         )
-        destination.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        manifest = {
-            "app": "RiftSense",
-            "format": 3,
-            "created_at": datetime.now().isoformat(
-                timespec="seconds"
-            ),
-            "includes": [
-                "settings.json",
-                "history/",
-                "player_memory.json",
-                "performance_history.json",
-                "rank_progress.json",
-                "ai_reviews/",
-            ],
-        }
-
-        with zipfile.ZipFile(
-            destination,
-            "w",
-            zipfile.ZIP_DEFLATED,
-        ) as archive:
-            archive.writestr(
-                "backup_manifest.json",
-                json.dumps(
-                    manifest,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-
-            if SETTINGS_PATH.exists():
-                backup_settings = load_json(
-                    SETTINGS_PATH,
-                    {},
-                )
-                if isinstance(backup_settings, dict):
-                    strip_persisted_secrets(backup_settings)
-                    archive.writestr(
-                        "settings.json",
-                        json.dumps(
-                            backup_settings,
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                else:
-                    archive.write(
-                        SETTINGS_PATH,
-                        "settings.json",
-                    )
-
-            if HISTORY_DIR.exists():
-                for path in HISTORY_DIR.rglob(
-                    "*"
-                ):
-                    if not path.is_file():
-                        continue
-
-                    archive_name = (
-                        "history/"
-                        + str(
-                            path.relative_to(
-                                HISTORY_DIR
-                            )
-                        ).replace(
-                            "\\",
-                            "/",
-                        )
-                    )
-
-                    # Defense in depth for backups created from older local
-                    # data. Legacy builds may have persisted a Riot API key
-                    # in riot_account.json; never copy those fields into a
-                    # newly created RiftSense backup archive.
-                    if path == RIOT_ACCOUNT_PATH:
-                        backup_account = load_json(
-                            path,
-                            {},
-                        )
-                        if isinstance(backup_account, dict):
-                            strip_persisted_secrets(backup_account)
-                            archive.writestr(
-                                archive_name,
-                                json.dumps(
-                                    backup_account,
-                                    ensure_ascii=False,
-                                    indent=2,
-                                ),
-                            )
-                            continue
-
-                    archive.write(
-                        path,
-                        archive_name,
-                    )
-
-            for memory_path, archive_name in (
-                (
-                    PLAYER_MEMORY_PATH,
-                    "player_memory.json",
-                ),
-                (
-                    PERFORMANCE_HISTORY_PATH,
-                    "performance_history.json",
-                ),
-                (
-                    RANK_PROGRESS_PATH,
-                    "rank_progress.json",
-                ),
-            ):
-                if memory_path.exists():
-                    archive.write(
-                        memory_path,
-                        archive_name,
-                    )
-
-            if AI_REVIEWS_DIR.exists():
-                for path in AI_REVIEWS_DIR.rglob(
-                    "*"
-                ):
-                    if path.is_file():
-                        archive.write(
-                            path,
-                            (
-                                "ai_reviews/"
-                                + str(
-                                    path.relative_to(
-                                        AI_REVIEWS_DIR
-                                    )
-                                ).replace(
-                                    "\\",
-                                    "/",
-                                )
-                            ),
-                        )
-
-        return destination
 
     def backup_user_data(self):
         suggested = (
@@ -37913,6 +38913,17 @@ class App(tk.Tk):
         if not source:
             return
 
+        # The ranked-history worker is the only background worker that writes
+        # backup-managed state directly. Other workers either write regenerable
+        # caches or marshal persistence back to Tk's blocked main thread.
+        sync_thread = getattr(self, "_riot_sync_thread", None)
+        if sync_thread and sync_thread.is_alive():
+            self.rs_warning(
+                "Restore unavailable during sync",
+                "Cancel the ranked-history sync and wait for it to finish before restoring a backup.",
+            )
+            return
+
         if not self.rs_confirm(
             "Restore backup",
             (
@@ -37926,251 +38937,49 @@ class App(tk.Tk):
         ):
             return
 
-        source = Path(
-            source
+        source = Path(source)
+        backup_dir = DATA_DIR / "backups"
+        safety_path = backup_dir / (
+            "before_restore_"
+            + datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+            + ".zip"
         )
 
         try:
-            with zipfile.ZipFile(
+            result = restore_backup_transactional(
                 source,
-                "r",
-            ) as archive:
-                names = archive.namelist()
-
-                for name in names:
-                    normalized = name.replace(
-                        "\\",
-                        "/",
-                    )
-                    parts = Path(
-                        normalized
-                    ).parts
-
-                    if (
-                        normalized.startswith("/")
-                        or ".." in parts
-                    ):
-                        raise ValueError(
-                            "Backup contains an unsafe path."
-                        )
-
-                    if normalized in {
-                        "backup_manifest.json",
-                        "settings.json",
-                        "player_memory.json",
-                        "performance_history.json",
-                        "rank_progress.json",
-                    }:
-                        continue
-
-                    if (
-                        normalized.startswith(
-                            "history/"
-                        )
-                        or normalized.startswith(
-                            "ai_reviews/"
-                        )
-                    ):
-                        continue
-
-                    raise ValueError(
-                        f"Unexpected file in backup: {normalized}"
-                    )
-
-                if (
-                    "settings.json"
-                    not in names
-                    and "player_memory.json"
-                    not in names
-                    and not any(
-                        name.startswith(
-                            "history/"
-                        )
-                        for name in names
-                    )
-                ):
-                    raise ValueError(
-                        "This ZIP does not look like a RiftSense or legacy Rift Build Assistant backup."
-                    )
-
-                backup_dir = (
-                    DATA_DIR
-                    / "backups"
-                )
-                backup_dir.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-                safety_path = (
-                    backup_dir
-                    / (
-                        "before_restore_"
-                        + datetime.now().strftime(
-                            "%Y-%m-%d_%H-%M-%S"
-                        )
-                        + ".zip"
-                    )
-                )
-                self._write_user_backup_zip(
-                    safety_path
-                )
-
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_root = Path(
-                        temp_dir
-                    )
-                    archive.extractall(
-                        temp_root
-                    )
-
-                    restored_settings = (
-                        temp_root
-                        / "settings.json"
-                    )
-                    restored_history = (
-                        temp_root
-                        / "history"
-                    )
-                    restored_memory = (
-                        temp_root
-                        / "player_memory.json"
-                    )
-                    restored_performance = (
-                        temp_root
-                        / "performance_history.json"
-                    )
-                    restored_rank_progress = (
-                        temp_root
-                        / "rank_progress.json"
-                    )
-                    restored_ai_reviews = (
-                        temp_root
-                        / "ai_reviews"
-                    )
-
-                    if restored_settings.exists():
-                        SETTINGS_PATH.parent.mkdir(
-                            parents=True,
-                            exist_ok=True,
-                        )
-                        shutil.copy2(
-                            restored_settings,
-                            SETTINGS_PATH,
-                        )
-
-                    if restored_history.exists():
-                        if HISTORY_DIR.exists():
-                            shutil.rmtree(
-                                HISTORY_DIR
-                            )
-                        shutil.copytree(
-                            restored_history,
-                            HISTORY_DIR,
-                        )
-
-                    if restored_memory.exists():
-                        shutil.copy2(
-                            restored_memory,
-                            PLAYER_MEMORY_PATH,
-                        )
-
-                    if restored_performance.exists():
-                        shutil.copy2(
-                            restored_performance,
-                            PERFORMANCE_HISTORY_PATH,
-                        )
-
-                    if restored_rank_progress.exists():
-                        shutil.copy2(
-                            restored_rank_progress,
-                            RANK_PROGRESS_PATH,
-                        )
-
-                    if restored_ai_reviews.exists():
-                        if AI_REVIEWS_DIR.exists():
-                            shutil.rmtree(
-                                AI_REVIEWS_DIR
-                            )
-                        shutil.copytree(
-                            restored_ai_reviews,
-                            AI_REVIEWS_DIR,
-                        )
-
-            HISTORY_DIR.mkdir(
-                parents=True,
-                exist_ok=True,
+                _backup_layout(),
+                application_version=APP_VERSION,
+                transform_json=_sanitize_backup_json,
+                safety_backup=safety_path,
+                safety_virtual_settings=SETTINGS,
+                recovery_parent=backup_dir,
             )
-            RIOT_HISTORY_DIR.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-            AI_REVIEWS_DIR.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            RIOT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            AI_REVIEWS_DIR.mkdir(parents=True, exist_ok=True)
 
             restored = load_json(
                 SETTINGS_PATH,
                 {},
             )
-            if isinstance(restored, dict):
-                if strip_persisted_secrets(restored):
-                    write_json_atomic(
-                        SETTINGS_PATH,
-                        restored,
-                    )
-
-            restored_account = load_json(
-                RIOT_ACCOUNT_PATH,
-                {},
-            )
-            if (
-                isinstance(restored_account, dict)
-                and strip_persisted_secrets(restored_account)
-            ):
-                write_json_atomic(
-                    RIOT_ACCOUNT_PATH,
-                    restored_account,
-                )
 
             SETTINGS.clear()
-            SETTINGS.update(
-                DEFAULT_SETTINGS
-            )
-            if isinstance(
-                restored,
-                dict,
-            ):
-                SETTINGS.update(
-                    restored
-                )
+            SETTINGS.update(DEFAULT_SETTINGS)
+            if isinstance(restored, dict):
+                SETTINGS.update(restored)
 
             self.history_metric_cache = {}
             self.reload_settings_page()
 
-            if hasattr(
-                self,
-                "history_riot_id_var",
-            ):
+            if hasattr(self, "history_riot_id_var"):
                 self.history_riot_id_var.set(
-                    str(
-                        SETTINGS.get(
-                            "riot_id",
-                            "",
-                        )
-                    )
+                    str(SETTINGS.get("riot_id", ""))
                 )
-            if hasattr(
-                self,
-                "history_platform_var",
-            ):
+            if hasattr(self, "history_platform_var"):
                 self.history_platform_var.set(
-                    str(
-                        SETTINGS.get(
-                            "riot_platform",
-                            "EUN1",
-                        )
-                    )
+                    str(SETTINGS.get("riot_platform", "EUN1"))
                 )
 
             self.refresh_history_tree()
@@ -38181,15 +38990,27 @@ class App(tk.Tk):
             self.refresh_personal_coach()
             self.refresh_general_page()
 
+            compatibility_note = (
+                "\n\nLegacy backup restored with structural and JSON validation "
+                "(legacy archives do not provide checksum guarantees)."
+                if result.legacy
+                else ""
+            )
             self.rs_info(
                 "Restore complete",
                 (
-                    "Backup restored successfully.\n\n"
+                    "Backup restored and verified successfully.\n\n"
                     "A copy of the previous data was saved to:\n"
                     f"{safety_path}"
+                    f"{compatibility_note}"
                 ),
             )
 
+        except RestoreTransactionError as exc:
+            self.rs_error(
+                "Restore failed",
+                str(exc),
+            )
         except Exception as exc:
             self.rs_error(
                 "Restore failed",
@@ -39086,9 +39907,33 @@ class App(tk.Tk):
 
 
     def on_close(self):
+        self._riot_request_cancel.set()
+        with self._riot_sync_terminal_lock:
+            self._riot_sync_cancel.set()
+        self._riot_sync_generation += 1
+        self._riot_sync_active_generation = None
+        self._general_rank_generation += 1
+        self._general_rank_active_generation = None
+        self._general_rank_refresh_inflight = False
+        self._riot_api_test_generation += 1
+        self._riot_api_test_active_generation = None
+        self._verify_sync_generation += 1
+        self._verify_sync_active_generation = None
         self._rune_import_shutdown = True
         self._rune_import_generation += 1
         self._pending_rune_import_request = None
+        self._icon_shutdown = True
+        self._icon_pending.clear()
+        for _worker in self._icon_workers:
+            self._icon_work_queue.put_nowait(None)
+        self._static_refresh_shutdown = True
+        self._static_refresh_generation += 1
+        self._static_refresh_pending = None
+        with self._poll_state_lock:
+            self._poll_shutdown = True
+            self._poll_generation += 1
+            self._poll_active_generation = None
+            self._poll_in_flight = False
         log_info(
             "Application closing"
         )
@@ -39103,6 +39948,8 @@ class App(tk.Tk):
             "_navigation_job",
             "_resize_job",
             "_poll_watch_job",
+            "_icon_watch_job",
+            "_static_refresh_watch_job",
             "_tier_list_watch_job",
             "_tier_list_icon_watch_job",
             "_general_rank_watch_job",
@@ -39119,10 +39966,6 @@ class App(tk.Tk):
                     self.after_cancel(job)
                 except Exception as exc:
                     log_warning("Best-effort on_close operation failed: " + str(exc))
-        try:
-            self._riot_sync_cancel.set()
-        except Exception as exc:
-            log_warning("Best-effort on_close operation failed: " + str(exc))
         if self._riot_sync_watch_job:
             try:
                 self.after_cancel(
@@ -39130,9 +39973,13 @@ class App(tk.Tk):
                 )
             except Exception as exc:
                 log_warning("Best-effort on_close operation failed: " + str(exc))
+        if not wait_for_json_idle(timeout=2.0):
+            log_warning(
+                "Shutdown timed out waiting for an active JSON persistence transaction."
+            )
         self.destroy()
 
-    def _poll_sources_worker(self):
+    def _poll_sources_worker(self, poll_generation):
         """
         Only raw localhost reads happen in this worker. Tk widgets are NEVER
         touched here; all UI processing stays on the main thread.
@@ -39189,6 +40036,7 @@ class App(tk.Tk):
                 )
 
         payload = (
+            poll_generation,
             session,
             draft_status,
             live_data,
@@ -39196,13 +40044,20 @@ class App(tk.Tk):
         )
 
         try:
-            # Keep only the newest result if a stale one is still queued.
-            if self._poll_queue.full():
-                try:
-                    self._poll_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self._poll_queue.put_nowait(payload)
+            # Generation validation and enqueue are atomic with timeout/shutdown
+            # invalidation. A worker may finish physically, but it cannot publish
+            # after its poll cycle stops being authoritative.
+            with self._poll_state_lock:
+                if (
+                    self._poll_shutdown
+                    or poll_generation != self._poll_active_generation
+                ):
+                    return
+                self._poll_queue.put_nowait(payload)
+        except queue.Full:
+            # A watcher will consume the already-published result. Never evict a
+            # possibly newer payload merely because this worker finished later.
+            return
         except Exception as exc:
             log_warning("Best-effort _poll_sources_worker operation failed: " + str(exc))
 
@@ -39214,21 +40069,49 @@ class App(tk.Tk):
         event loop. A timeout could therefore freeze sidebar clicks for up to
         several seconds. V25 keeps network I/O off the UI thread.
         """
-        if not self._poll_in_flight:
-            self._poll_in_flight = True
-            self._poll_started_at = time.monotonic()
+        with self._poll_state_lock:
+            if self._poll_shutdown:
+                return
+            if not self._poll_in_flight:
+                self._poll_generation += 1
+                self._poll_active_generation = self._poll_generation
+                self._poll_in_flight = True
+                self._poll_started_at = time.monotonic()
+                poll_generation = self._poll_active_generation
+                start_worker = True
+            else:
+                poll_generation = self._poll_active_generation
+                start_worker = False
+
+        if start_worker:
             threading.Thread(
                 target=self._poll_sources_worker,
+                args=(poll_generation,),
                 name="RiftLocalPoll",
                 daemon=True,
             ).start()
 
-        self._watch_poll_result()
+        self._watch_poll_result(poll_generation)
 
-    def _watch_poll_result(self):
-        try:
-            payload = self._poll_queue.get_nowait()
-        except queue.Empty:
+    def _watch_poll_result(self, poll_generation):
+        with self._poll_state_lock:
+            if (
+                self._poll_shutdown
+                or poll_generation != self._poll_active_generation
+            ):
+                return
+
+        payload = None
+        while True:
+            try:
+                candidate = self._poll_queue.get_nowait()
+            except queue.Empty:
+                break
+            if candidate[0] == poll_generation:
+                payload = candidate
+                break
+
+        if payload is None:
             # Keep the UI fully responsive while the localhost call is pending.
             if (
                 self._poll_in_flight
@@ -39236,20 +40119,45 @@ class App(tk.Tk):
             ):
                 self._poll_watch_job = self.after(
                     35,
-                    self._watch_poll_result,
+                    lambda generation=poll_generation: self._watch_poll_result(
+                        generation
+                    ),
                 )
                 return
 
-            # Worker took too long; don't stack another worker immediately.
-            self._poll_in_flight = False
+            # Worker took too long. Invalidate this generation before another
+            # worker can become authoritative, but let the old thread finish.
+            with self._poll_state_lock:
+                if (
+                    self._poll_shutdown
+                    or poll_generation != self._poll_active_generation
+                ):
+                    return
+                self._poll_generation += 1
+                self._poll_active_generation = None
+                self._poll_in_flight = False
             self._poll_watch_job = self.after(
                 REFRESH_MS,
                 self.refresh_all,
             )
             return
 
-        self._poll_in_flight = False
-        session, draft_status, live_data, _completed_at = payload
+        with self._poll_state_lock:
+            if (
+                self._poll_shutdown
+                or poll_generation != self._poll_active_generation
+            ):
+                return
+            self._poll_active_generation = None
+            self._poll_in_flight = False
+
+        (
+            _result_generation,
+            session,
+            draft_status,
+            live_data,
+            _completed_at,
+        ) = payload
 
         try:
             draft_active = self.refresh_draft(
@@ -39404,6 +40312,7 @@ class App(tk.Tk):
         generation,
         champion,
         role,
+        session_identity=None,
     ):
         return bool(
             not getattr(
@@ -39442,6 +40351,48 @@ class App(tk.Tk):
                     "",
                 )
             )
+            and session_identity is not None
+            and session_identity
+            == getattr(
+                self,
+                "_rune_import_session_identity",
+                None,
+            )
+        )
+
+    @staticmethod
+    def _champ_select_session_identity(
+        session,
+    ):
+        """Return the authoritative LCU identity for one Champion Select."""
+        if not isinstance(
+            session,
+            dict,
+        ):
+            return None
+
+        game_id = session.get(
+            "gameId"
+        )
+        if isinstance(
+            game_id,
+            bool,
+        ):
+            return None
+        try:
+            normalized = int(
+                game_id
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+        if normalized <= 0:
+            return None
+        return (
+            "gameId",
+            normalized,
         )
 
     def _rune_import_prewrite_valid(
@@ -39449,11 +40400,13 @@ class App(tk.Tk):
         generation,
         champion,
         role,
+        session_identity,
     ):
         if not self._rune_import_matches_current_state(
             generation,
             champion,
             role,
+            session_identity,
         ):
             return False
 
@@ -39468,6 +40421,7 @@ class App(tk.Tk):
             generation,
             champion,
             role,
+            session_identity,
         ):
             return False
         if status != 200 or not isinstance(
@@ -39475,30 +40429,16 @@ class App(tk.Tk):
             dict,
         ):
             return False
+        if self._champ_select_session_identity(
+            session
+        ) != session_identity:
+            return False
 
-        local_cell = session.get(
-            "localPlayerCellId"
+        local_resolution = resolve_champion_select_player(
+            session
         )
-        local_entry = next(
-            (
-                entry
-                for entry in (
-                    session.get(
-                        "myTeam"
-                    )
-                    or []
-                )
-                if entry.get(
-                    "cellId"
-                )
-                == local_cell
-            ),
-            None,
-        )
-        if not isinstance(
-            local_entry,
-            dict,
-        ):
+        local_entry = local_resolution.candidate
+        if not local_resolution.matched or not isinstance(local_entry, dict):
             return False
 
         session_champion = self.dd.champion_name(
@@ -39528,6 +40468,7 @@ class App(tk.Tk):
                 generation,
                 champion,
                 role,
+                session_identity,
             )
         )
 
@@ -39539,6 +40480,7 @@ class App(tk.Tk):
         variant,
         request_signature,
         generation=None,
+        session_identity=None,
     ):
         if generation is None:
             generation = getattr(
@@ -39550,6 +40492,24 @@ class App(tk.Tk):
         def post(
             payload,
         ):
+            event_type = payload.get(
+                "type"
+            )
+            if (
+                session_identity is not None
+                and event_type == "error"
+            ):
+                try:
+                    still_valid = self._rune_import_prewrite_valid(
+                        generation,
+                        champion,
+                        role,
+                        session_identity,
+                    )
+                except Exception:
+                    still_valid = False
+                if not still_valid:
+                    return
             event = dict(
                 payload
             )
@@ -39742,6 +40702,7 @@ class App(tk.Tk):
                 generation,
                 champion,
                 role_key,
+                session_identity,
             ):
                 return
 
@@ -39754,10 +40715,11 @@ class App(tk.Tk):
 
             # A request can be superseded while the LCU mutation is in flight.
             # Its completion must not replace the status of the newer request.
-            if not self._rune_import_matches_current_state(
+            if not self._rune_import_prewrite_valid(
                 generation,
                 champion,
                 role_key,
+                session_identity,
             ):
                 return
 
@@ -39823,10 +40785,11 @@ class App(tk.Tk):
                     ]
                 )
 
-            if not self._rune_import_matches_current_state(
+            if not self._rune_import_prewrite_valid(
                 generation,
                 champion,
                 role_key,
+                session_identity,
             ):
                 return
 
@@ -39937,13 +40900,21 @@ class App(tk.Tk):
             self._pending_rune_import_request = None
 
             if pending:
-                champion, role, variant, automatic, generation = pending
+                (
+                    champion,
+                    role,
+                    variant,
+                    automatic,
+                    generation,
+                    session_identity,
+                ) = pending
                 self._start_rune_import(
                     champion,
                     role,
                     variant,
                     automatic=automatic,
                     generation=generation,
+                    session_identity=session_identity,
                 )
                 return
 
@@ -39960,6 +40931,7 @@ class App(tk.Tk):
         variant,
         automatic=False,
         generation=None,
+        session_identity=None,
     ):
         champion = str(
             champion
@@ -40013,6 +40985,13 @@ class App(tk.Tk):
             )
             return
 
+        if session_identity is None:
+            session_identity = getattr(
+                self,
+                "_rune_import_session_identity",
+                None,
+            )
+
         signature = (
             normalize_name(
                 champion
@@ -40023,6 +41002,7 @@ class App(tk.Tk):
             variant,
             rune_text,
             self.dd.version,
+            session_identity,
         )
 
         if (
@@ -40037,6 +41017,15 @@ class App(tk.Tk):
             "_rune_import_shutdown",
             False,
         ):
+            return
+
+        if session_identity is None:
+            self.rune_import_status_var.set(
+                "Rune import is waiting for a verified Champion Select session."
+            )
+            self.rune_import_status_label.configure(
+                fg=MUTED
+            )
             return
 
         if generation is None:
@@ -40055,6 +41044,7 @@ class App(tk.Tk):
                 variant,
                 automatic,
                 generation,
+                session_identity,
             )
             return
 
@@ -40081,6 +41071,7 @@ class App(tk.Tk):
                 variant,
                 signature,
                 generation,
+                session_identity,
             ),
             name="RiftRuneImport",
             daemon=True,
@@ -40111,6 +41102,11 @@ class App(tk.Tk):
             self.current_rune_role,
             variant,
             automatic=automatic,
+            session_identity=getattr(
+                self,
+                "_rune_import_session_identity",
+                None,
+            ),
         )
 
     def update_meta_status_ui(
@@ -40435,13 +41431,7 @@ class App(tk.Tk):
             "item_data",
             None,
         ):
-            version = self.dd.resolve_version(
-                ""
-            )
-            if version:
-                self.dd.load_items(
-                    version
-                )
+            self._request_static_data_refresh("")
 
         if not getattr(
             self.dd,
@@ -40902,6 +41892,7 @@ class App(tk.Tk):
                 self._rune_import_generation += 1
                 self._pending_rune_import_request = None
             self._rune_import_draft_active = False
+            self._rune_import_session_identity = None
             # Render the empty Draft state once, not on every poll.
             if not self._draft_waiting_rendered:
                 self._draft_waiting_rendered = True
@@ -40942,6 +41933,22 @@ class App(tk.Tk):
                 )
             return False
 
+        session_identity = self._champ_select_session_identity(
+            session
+        )
+        previous_session_identity = getattr(
+            self,
+            "_rune_import_session_identity",
+            None,
+        )
+        if (
+            previous_session_identity is not None
+            and session_identity != previous_session_identity
+        ):
+            self._rune_import_generation += 1
+            self._pending_rune_import_request = None
+            self.last_rune_import_signature = None
+        self._rune_import_session_identity = session_identity
         self._rune_import_draft_active = True
         self._draft_waiting_rendered = False
 
@@ -40949,10 +41956,38 @@ class App(tk.Tk):
         my_team = session.get("myTeam") or []
         their_team = session.get("theirTeam") or []
 
-        local_entry = next(
-            (x for x in my_team if x.get("cellId") == local_cell),
-            {},
+        local_resolution = resolve_champion_select_player(
+            session
         )
+        local_entry = local_resolution.candidate or {}
+        if not local_resolution.matched:
+            self._rune_import_generation += 1
+            self._pending_rune_import_request = None
+            self.draft_signature = None
+            self.current_rune_champion = ""
+            self.current_rune_role = ""
+            self.current_rune_choices = {}
+            self.draft_role.set("Role: unavailable")
+            self.draft_pick_context_var.set(
+                "PICK CONTEXT: local player identity unavailable"
+            )
+            self.clear_frame(self.ally_icons)
+            self.clear_frame(self.enemy_icons_draft)
+            self.clear_frame(self.recommendations)
+            self.draft_status.set(
+                "Champion Select detected, but local player identity is unavailable."
+            )
+            self.rune_import_status_var.set(
+                "Local Champion Select identity is unavailable; rune import paused."
+            )
+            self.rune_import_status_label.configure(
+                fg=MUTED
+            )
+            log_warning(
+                "Champion Select identity unresolved: "
+                + local_resolution.reason
+            )
+            return True
         role_raw = local_entry.get("assignedPosition") or ""
         role = role_label(role_raw)
         local_champion = self.dd.champion_name(
@@ -41030,6 +42065,7 @@ class App(tk.Tk):
             )
 
         signature = (
+            session_identity,
             role,
             local_champion,
             tuple(ally_names),
@@ -41198,18 +42234,15 @@ class App(tk.Tk):
         V19 intentionally removes the S/A/B/C tier badge from the image itself.
         Tier information may still be shown as normal text beside the champion.
         """
-        path = self.dd.champion_icon_path(champion_name)
-        photo = self.load_photo(
-            path,
-            target_px=int(SETTINGS.get("draft_icon_px", 44)),
+        target_px = int(SETTINGS.get("draft_icon_px", 44))
+        cached_path = self._cached_icon_path("champion", champion_name)
+        photo = (
+            self.load_photo(cached_path, target_px=target_px)
+            if cached_path
+            else None
         )
-
-        if photo:
-            width = photo.width()
-            height = photo.height()
-        else:
-            width = int(SETTINGS.get("draft_icon_px", 44))
-            height = width
+        width = photo.width() if photo else target_px
+        height = photo.height() if photo else target_px
 
         canvas = tk.Canvas(
             parent,
@@ -41223,12 +42256,7 @@ class App(tk.Tk):
         canvas.pack(side="left", padx=(2, 7))
 
         if photo:
-            canvas.create_image(
-                0,
-                0,
-                image=photo,
-                anchor="nw",
-            )
+            canvas.create_image(0, 0, image=photo, anchor="nw")
             canvas._champion_photo = photo
         else:
             canvas.create_text(
@@ -41237,6 +42265,15 @@ class App(tk.Tk):
                 text="?",
                 fill=FG,
                 font=ui_font(16, "bold"),
+                tags=("riftsense_icon_placeholder",),
+            )
+            self._request_widget_icon(
+                canvas,
+                "champion",
+                champion_name,
+                target_px,
+                display_kind="canvas",
+                reference_attr="_champion_photo",
             )
 
         Tooltip(
@@ -41771,16 +42808,55 @@ class App(tk.Tk):
         self._live_waiting_rendered = False
         self.begin_live_session()
 
-        player = find_active_player(data)
-        if not player:
+        identity_resolution = resolve_active_player(data)
+        self.current_live_identity_resolution = identity_resolution
+        player = identity_resolution.candidate
+        if not identity_resolution.matched or not player:
+            ambiguous = identity_resolution.decision is IdentityDecision.AMBIGUOUS
+            self.current_player_champion = ""
+            self.current_player_role = "UNKNOWN"
+            self.current_item_signature = None
+            self.build_signature = None
+            self.adaptive_signature = None
+            self.full_build_signature = None
+            self.current_full_build = []
+            self.player_var.set("Player: identity unavailable")
+            self.stats_var.set("Stats: unavailable")
+            self.enemy_var.set("Enemies: unavailable")
+            self.live_player_summary_var.set(
+                "YOU • identity unavailable"
+            )
+            self.path_var.set(
+                "Personalized recommendations are paused until player identity is unique."
+            )
+            self.note_var.set("")
+            self.clear_frame(self.current_icons)
+            self.clear_frame(self.full_build_icons_frame)
+            self.clear_frame(self.companion_options_frame)
+            self.clear_frame(self.enemy_threats_frame)
+            self.clear_frame(self.adaptive_options_frame)
+            self.clear_frame(self.build_icons)
+            self.render_team_comparison_waiting()
             self.live_status.set(
-                "Game detected, but active player could not be identified."
+                "Game detected, but active player identity is ambiguous."
+                if ambiguous
+                else "Game detected, but active player could not be identified."
             )
             self.set_live_state_banner(
                 "off",
-                "PLAYER DETECTION FAILED",
-                "League is running, but RiftSense could not map the active player yet.",
+                "PLAYER IDENTITY AMBIGUOUS"
+                if ambiguous
+                else "PLAYER DETECTION FAILED",
+                (
+                    "Live match detected; personalized recommendations are temporarily unavailable."
+                    if ambiguous
+                    else "League is running, but RiftSense could not map the active player yet."
+                ),
                 visible=True,
+            )
+            log_warning(
+                "Live active-player identity unresolved: "
+                + identity_resolution.reason
             )
             return True
 
@@ -42957,6 +44033,18 @@ class App(tk.Tk):
                 width=4,
                 height=2,
             )
+            self._request_widget_icon(
+                widgets["our_icon"],
+                "champion",
+                None,
+                int(SETTINGS.get("champion_icon_px", 28)),
+            )
+            self._request_widget_icon(
+                widgets["enemy_icon"],
+                "champion",
+                None,
+                int(SETTINGS.get("champion_icon_px", 28)),
+            )
             self.reset_enemy_duel_visual(
                 widgets
             )
@@ -42982,7 +44070,6 @@ class App(tk.Tk):
             f"Lv {level} • {kills}/{deaths}/{assists} • {cs} CS"
         )
         icon=widgets[f"{prefix}_icon"]
-        path=self.dd.champion_icon_path(champion) if player else None
         lane_icon_px = max(
             30,
             min(
@@ -42997,30 +44084,20 @@ class App(tk.Tk):
                 + 4,
             ),
         )
-        photo = (
-            self.load_photo(
-                path,
-                target_px=lane_icon_px,
-            )
-            if path
-            else None
+        icon.configure(
+            image="",
+            text="?",
+            width=4,
+            height=2,
         )
-        if photo:
-            icon.configure(
-                image=photo,
-                text="",
-                width=0,
-                height=0,
-            )
-            icon._champion_photo = photo
-        else:
-            icon.configure(
-                image="",
-                text="?",
-                width=4,
-                height=2,
-            )
-            icon._champion_photo = None
+        icon._champion_photo = None
+        self._request_widget_icon(
+            icon,
+            "champion",
+            champion if player else None,
+            lane_icon_px,
+            reference_attr="_champion_photo",
+        )
 
     def draw_lane_sparkline(self, canvas, history):
         canvas.delete("all")
@@ -43898,13 +44975,15 @@ class App(tk.Tk):
             top = ttk.Frame(card, style="Panel.TFrame")
             top.pack(fill="x")
 
-            path = self.current_item_icon_path(option["item_id"])
-            photo = self.load_photo(path, target_px=40)
-            if photo:
-                icon = ttk.Label(top, image=photo, style="Panel.TLabel")
-            else:
-                icon = ttk.Label(top, text="?", style="Panel.TLabel", width=6)
+            icon = ttk.Label(top, text="?", style="Panel.TLabel", width=6)
             icon.pack(side="left", padx=(0, 5))
+            self._request_widget_icon(
+                icon,
+                "item",
+                option["item_id"],
+                40,
+                reference_attr="_item_photo",
+            )
             Tooltip(icon, option["name"])
 
             title_box = ttk.Frame(top, style="Panel.TFrame")
@@ -44164,52 +45243,27 @@ class App(tk.Tk):
             item_id = item.get(
                 "item_id"
             )
-            photo = None
-            if item_id:
-                path = self.current_item_icon_path(
-                    item_id
+            is_boot_slot = is_boot_item_name(
+                item.get(
+                    "name",
+                    "",
                 )
-                photo = self.load_photo(
-                    path,
-                    target_px=48,
-                )
-
-            if photo:
-                icon = tk.Label(
-                    inner,
-                    image=photo,
-                    bg=PANEL_ALT,
-                    bd=0,
-                )
-                icon._item_photo = photo
-            else:
-                is_boot_slot = is_boot_item_name(
-                    item.get(
-                        "name",
-                        "",
-                    )
-                )
-                icon = tk.Label(
-                    inner,
-                    text=(
-                        "BOOT"
-                        if is_boot_slot
-                        else "?"
-                    ),
-                    bg=PANEL_ALT,
-                    fg=(
-                        ACCENT
-                        if is_boot_slot
-                        else FG
-                    ),
-                    width=5,
-                    font=ui_font(
-                        9
-                        if is_boot_slot
-                        else 16,
-                        "bold",
-                    ),
-                )
+            )
+            icon = tk.Label(
+                inner,
+                text=("BOOT" if is_boot_slot else "?"),
+                bg=PANEL_ALT,
+                fg=(ACCENT if is_boot_slot else FG),
+                width=5,
+                font=ui_font(9 if is_boot_slot else 16, "bold"),
+            )
+            self._request_widget_icon(
+                icon,
+                "item",
+                item_id,
+                48,
+                reference_attr="_item_photo",
+            )
             icon.pack(
                 pady=(0, 1),
             )
@@ -44394,37 +45448,21 @@ class App(tk.Tk):
                 pady=7,
             )
 
-            photo = None
-            if item_id:
-                path = self.current_item_icon_path(
-                    item_id
-                )
-                photo = self.load_photo(
-                    path,
-                    target_px=44,
-                )
-
-            if photo:
-                icon = tk.Label(
-                    inner,
-                    image=photo,
-                    bg=PANEL_ALT,
-                    bd=0,
-                )
-                icon._item_photo = photo
-            else:
-                icon = tk.Label(
-                    inner,
-                    text=color[0],
-                    bg=PANEL_ALT,
-                    fg=FG,
-                    width=4,
-                    font=(
-                        "Segoe UI",
-                        14,
-                        "bold",
-                    ),
-                )
+            icon = tk.Label(
+                inner,
+                text=color[0],
+                bg=PANEL_ALT,
+                fg=FG,
+                width=4,
+                font=("Segoe UI", 14, "bold"),
+            )
+            self._request_widget_icon(
+                icon,
+                "item",
+                item_id,
+                44,
+                reference_attr="_item_photo",
+            )
 
             icon.pack(
                 side="left",
@@ -44557,21 +45595,21 @@ class App(tk.Tk):
             inner = tk.Frame(card, bg=PANEL_ALT)
             inner.pack(fill="both", expand=True, padx=6, pady=6)
 
-            path = self.dd.champion_icon_path(champion)
-            photo = self.load_photo(path, target_px=int(SETTINGS.get("champion_icon_px", 28)))
-
-            if photo:
-                icon = tk.Label(inner, image=photo, bg=PANEL_ALT, bd=0)
-                icon._champion_photo = photo
-            else:
-                icon = tk.Label(
-                    inner,
-                    text="?",
-                    bg=PANEL_ALT,
-                    fg=FG,
-                    width=4,
-                )
+            icon = tk.Label(
+                inner,
+                text="?",
+                bg=PANEL_ALT,
+                fg=FG,
+                width=4,
+            )
             icon.pack(side="left", padx=(0, 6))
+            self._request_widget_icon(
+                icon,
+                "champion",
+                champion,
+                int(SETTINGS.get("champion_icon_px", 28)),
+                reference_attr="_champion_photo",
+            )
 
             text_box = tk.Frame(inner, bg=PANEL_ALT)
             text_box.pack(side="left", fill="both", expand=True)
@@ -44772,18 +45810,20 @@ class App(tk.Tk):
                 holder = ttk.Frame(self.purchase_plan_frame, style="Panel.TFrame")
                 holder.pack(side="left", padx=(0 if i == 1 else 10, 0))
 
-                path = self.current_item_icon_path(purchase["item_id"])
-                photo = self.load_photo(path, small=False)
-                if photo:
-                    icon = ttk.Label(holder, image=photo, style="Panel.TLabel")
-                else:
-                    icon = ttk.Label(
-                        holder,
-                        text="?",
-                        style="Panel.TLabel",
-                        width=6,
-                    )
+                icon = ttk.Label(
+                    holder,
+                    text="?",
+                    style="Panel.TLabel",
+                    width=6,
+                )
                 icon.pack()
+                self._request_widget_icon(
+                    icon,
+                    "item",
+                    purchase["item_id"],
+                    64,
+                    reference_attr="_item_photo",
+                )
                 Tooltip(icon, purchase["name"])
 
                 ttk.Label(
@@ -44811,13 +45851,15 @@ class App(tk.Tk):
             holder = ttk.Frame(self.purchase_plan_frame, style="Panel.TFrame")
             holder.pack(side="left")
 
-            path = self.current_item_icon_path(save["item_id"])
-            photo = self.load_photo(path, small=False)
-            if photo:
-                icon = ttk.Label(holder, image=photo, style="Panel.TLabel")
-            else:
-                icon = ttk.Label(holder, text="?", style="Panel.TLabel", width=6)
+            icon = ttk.Label(holder, text="?", style="Panel.TLabel", width=6)
             icon.pack(side="left", padx=(0, 8))
+            self._request_widget_icon(
+                icon,
+                "item",
+                save["item_id"],
+                64,
+                reference_attr="_item_photo",
+            )
             Tooltip(icon, save["name"])
 
             ttk.Label(

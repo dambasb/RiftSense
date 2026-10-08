@@ -56,17 +56,18 @@ class _ControlledLCU:
         self.write_reached = threading.Event()
         self.release_write = threading.Event()
         self.release_write.set()
-        self.session = self.make_session(1, "JUNGLE")
+        self.session = self.make_session(1, "JUNGLE", game_id=1001)
         self.session_status = 200
         self.writes = []
 
     @staticmethod
-    def make_session(champion_id, role):
+    def make_session(champion_id, role, game_id=1001, cell_id=7):
         return {
-            "localPlayerCellId": 7,
+            "gameId": game_id,
+            "localPlayerCellId": cell_id,
             "myTeam": [
                 {
-                    "cellId": 7,
+                    "cellId": cell_id,
                     "championId": champion_id,
                     "assignedPosition": role,
                 }
@@ -118,12 +119,24 @@ class RuneImportGenerationTests(unittest.TestCase):
         app._rune_import_generation = generation
         app._rune_import_draft_active = True
         app._rune_import_shutdown = False
+        app._rune_import_session_identity = self.m.App._champ_select_session_identity(
+            app.lcu.session
+        )
         app.current_rune_champion = champion
         app.current_rune_role = role
         app.current_rune_choices = self.m.rune_choices_for_role(champion, role)
         return app
 
-    def start_worker(self, app, champion="Wukong", role="JUNGLE", generation=1):
+    def start_worker(
+        self,
+        app,
+        champion="Wukong",
+        role="JUNGLE",
+        generation=1,
+        session_identity=None,
+    ):
+        if session_identity is None:
+            session_identity = app._rune_import_session_identity
         worker = threading.Thread(
             target=self.m.App._rune_import_worker,
             args=(
@@ -133,6 +146,7 @@ class RuneImportGenerationTests(unittest.TestCase):
                 "recommended",
                 (champion, role, generation),
                 generation,
+                session_identity,
             ),
         )
         worker.start()
@@ -185,7 +199,7 @@ class RuneImportGenerationTests(unittest.TestCase):
             worker = self.start_worker(app)
             self.assertTrue(app.lcu.pages_reached.wait(timeout=2.0))
             app.current_rune_champion = "Nocturne"
-            app.lcu.session = app.lcu.make_session(2, "JUNGLE")
+            app.lcu.session = app.lcu.make_session(2, "JUNGLE", game_id=1001)
             self.finish_worker(worker, app)
 
         self.run_with_selection(exercise)
@@ -202,7 +216,7 @@ class RuneImportGenerationTests(unittest.TestCase):
             worker = self.start_worker(app)
             self.assertTrue(app.lcu.pages_reached.wait(timeout=2.0))
             app.current_rune_role = "MID"
-            app.lcu.session = app.lcu.make_session(1, "MIDDLE")
+            app.lcu.session = app.lcu.make_session(1, "MIDDLE", game_id=1001)
             self.finish_worker(worker, app)
 
         self.run_with_selection(exercise)
@@ -252,7 +266,7 @@ class RuneImportGenerationTests(unittest.TestCase):
             app._rune_import_generation = 2
             app.current_rune_champion = "Nocturne"
             app.current_rune_choices = self.m.rune_choices_for_role("Nocturne", "JUNGLE")
-            app.lcu.session = app.lcu.make_session(2, "JUNGLE")
+            app.lcu.session = app.lcu.make_session(2, "JUNGLE", game_id=1001)
             self.finish_worker(old_worker, app)
 
             app.lcu.pages_reached.clear()
@@ -312,8 +326,8 @@ class RuneImportGenerationTests(unittest.TestCase):
         )
         second_pending = app._pending_rune_import_request
 
-        self.assertEqual(first_pending[-1], 1)
-        self.assertEqual(second_pending[-1], 2)
+        self.assertEqual(first_pending[-2], 1)
+        self.assertEqual(second_pending[-2], 2)
         self.assertEqual(second_pending[0], "Nocturne")
 
     def test_superseded_during_lcu_write_does_not_report_success(self):
@@ -331,6 +345,109 @@ class RuneImportGenerationTests(unittest.TestCase):
         events = self.events(app)
         self.assertEqual(len(app.lcu.writes), 1)
         self.assertNotIn("success", [event["type"] for event in events])
+
+    def test_replacement_session_with_same_context_rejects_old_request(self):
+        app = self.make_app()
+        app.lcu.block_pages()
+        session_a_identity = app._rune_import_session_identity
+
+        def exercise():
+            worker = self.start_worker(
+                app,
+                session_identity=session_a_identity,
+            )
+            self.assertTrue(app.lcu.pages_reached.wait(timeout=2.0))
+            app.lcu.session = app.lcu.make_session(
+                1,
+                "JUNGLE",
+                game_id=1002,
+                cell_id=7,
+            )
+            self.finish_worker(worker, app)
+
+        self.run_with_selection(exercise)
+
+        events = self.events(app)
+        self.assertEqual(app.lcu.writes, [])
+        self.assertNotIn("success", [event["type"] for event in events])
+        self.assertNotIn("error", [event["type"] for event in events])
+
+    def test_new_request_in_replacement_session_succeeds(self):
+        app = self.make_app()
+        app.lcu.block_pages()
+        session_a_identity = app._rune_import_session_identity
+
+        def exercise():
+            old_worker = self.start_worker(
+                app,
+                session_identity=session_a_identity,
+            )
+            self.assertTrue(app.lcu.pages_reached.wait(timeout=2.0))
+            app.lcu.session = app.lcu.make_session(
+                1,
+                "JUNGLE",
+                game_id=1002,
+                cell_id=7,
+            )
+            self.finish_worker(old_worker, app)
+
+            app._rune_import_generation = 2
+            app._rune_import_session_identity = (
+                self.m.App._champ_select_session_identity(app.lcu.session)
+            )
+            app.lcu.pages_reached.clear()
+            new_worker = self.start_worker(
+                app,
+                generation=2,
+            )
+            self.finish_worker(new_worker, app)
+
+        self.run_with_selection(exercise)
+
+        events = self.events(app)
+        successes = [event for event in events if event["type"] == "success"]
+        self.assertEqual(len(app.lcu.writes), 1)
+        self.assertEqual([event["generation"] for event in successes], [2])
+
+    def test_session_change_during_write_cannot_report_success(self):
+        app = self.make_app()
+        app.lcu.block_write()
+
+        def exercise():
+            worker = self.start_worker(app)
+            self.assertTrue(app.lcu.write_reached.wait(timeout=2.0))
+            app.lcu.session = app.lcu.make_session(
+                1,
+                "JUNGLE",
+                game_id=1002,
+                cell_id=7,
+            )
+            self.finish_worker(worker, app)
+
+        self.run_with_selection(exercise)
+
+        events = self.events(app)
+        self.assertEqual(len(app.lcu.writes), 1)
+        self.assertNotIn("success", [event["type"] for event in events])
+        self.assertNotIn("error", [event["type"] for event in events])
+
+    def test_missing_session_identity_fails_closed(self):
+        app = self.make_app()
+        app.lcu.session = app.lcu.make_session(
+            1,
+            "JUNGLE",
+            game_id=None,
+        )
+        app._rune_import_session_identity = None
+
+        def exercise():
+            worker = self.start_worker(app, session_identity=("gameId", 1001))
+            self.finish_worker(worker, app)
+
+        self.run_with_selection(exercise)
+
+        self.assertEqual(app.lcu.writes, [])
+        self.assertNotIn("success", [event["type"] for event in self.events(app)])
 
 
 if __name__ == "__main__":
